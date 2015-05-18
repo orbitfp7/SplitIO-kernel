@@ -10,6 +10,10 @@
 
 #if defined(CONFIG_MACVTAP) || defined(CONFIG_MACVTAP_MODULE)
 struct socket *macvtap_get_socket(struct file *);
+#if 1 /* patchouli vrio-macvtap */
+struct sk_buff *macvtap_recvskb(struct socket *sock);
+void macvtap_sendskb(struct socket *sock, struct sk_buff *skb);
+#endif
 #else
 #include <linux/err.h>
 #include <linux/errno.h>

@@ -19,6 +19,10 @@
 
 #if defined(CONFIG_TUN) || defined(CONFIG_TUN_MODULE)
 struct socket *tun_get_socket(struct file *);
+#if 1 /* patchouli vrio-tun */
+struct sk_buff *tun_recvskb(struct socket *sock);
+void tun_sendskb(struct socket *sock, struct sk_buff *skb);
+#endif
 #else
 #include <linux/err.h>
 #include <linux/errno.h>

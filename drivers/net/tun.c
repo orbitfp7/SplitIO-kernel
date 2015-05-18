@@ -1475,6 +1475,32 @@ static void tun_sock_write_space(struct sock *sk)
 	kill_fasync(&tfile->fasync, SIGIO, POLL_OUT);
 }
 
+#if 1 /* patchouli vrio-tun */
+void tun_sendskb(struct socket *sock, struct sk_buff *skb)
+{
+	struct tun_file *tfile = container_of(sock, struct tun_file, socket);
+	struct tun_struct *tun = __tun_get(tfile);
+
+    if (!tun)
+        return;
+    tun_net_xmit(skb, tun->dev);
+	tun_put(tun);
+}
+EXPORT_SYMBOL_GPL(tun_sendskb);
+
+struct sk_buff *tun_recvskb(struct socket *sock)
+{
+	struct tun_file *tfile = container_of(sock, struct tun_file, socket);
+	struct sk_buff *skb;
+
+	if (!tfile)
+		return NULL;
+	skb = skb_dequeue(&tfile->socket.sk->sk_receive_queue);
+	return skb;
+}
+EXPORT_SYMBOL_GPL(tun_recvskb);
+#endif
+
 static int tun_sendmsg(struct kiocb *iocb, struct socket *sock,
 		       struct msghdr *m, size_t total_len)
 {

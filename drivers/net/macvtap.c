@@ -1197,6 +1197,34 @@ static const struct file_operations macvtap_fops = {
 #endif
 };
 
+#if 1 /* patchouli vrio-macvtap */
+void macvtap_sendskb(struct socket *sock, struct sk_buff *skb)
+{
+	struct macvtap_queue *q = container_of(sock, struct macvtap_queue, sock);
+	struct macvlan_dev *vlan;
+
+	rcu_read_lock();
+	vlan = rcu_dereference(q->vlan);
+	if (vlan)
+		macvlan_start_xmit(skb, vlan->dev);
+	else
+		kfree_skb(skb);
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_GPL(macvtap_sendskb);
+
+struct sk_buff *macvtap_recvskb(struct socket *sock)
+{
+	struct macvtap_queue *q = container_of(sock, struct macvtap_queue, sock);
+	struct sk_buff *skb;
+
+    /* Read frames from the queue */
+    skb = skb_dequeue(&q->sk.sk_receive_queue);
+	return skb;
+}
+EXPORT_SYMBOL_GPL(macvtap_recvskb);
+#endif
+
 static int macvtap_sendmsg(struct kiocb *iocb, struct socket *sock,
 			   struct msghdr *m, size_t total_len)
 {
