@@ -150,11 +150,37 @@ struct sk_buff;
 #define MAX_SKB_FRAGS (65536/PAGE_SIZE + 1)
 #endif
 
+#if 1 /* patchouli vrio-skbuff */
+/*
+ * The I/O hypervisor optimize the reconstruction of the original skb
+ * originated from a VM. To avoid costly copy operations we allow more frags
+ * as each fragment is probably less than PAGE_SIZE
+ *
+ */
+#undef MAX_SKB_FRAGS
+#define MAX_SKB_FRAGS 26
+
+struct skb_frag_destructor {
+	atomic_t ref;
+	char data[20];
+	int (*destructor)(struct skb_frag_destructor *destructor);
+};
+
+static inline void init_frag_destructor(struct skb_frag_destructor *frag_destructor, int (*destructor)(struct skb_frag_destructor *destructor)) {
+	atomic_set(&frag_destructor->ref, 0);
+	frag_destructor->destructor = destructor;
+}
+
+#define FRAG_DESTROY_DATA(destroy, type) ((type)(destroy)->data)
+#endif
 typedef struct skb_frag_struct skb_frag_t;
 
 struct skb_frag_struct {
 	struct {
 		struct page *p;
+#if 1 /* patchouli vrio-skbuff */
+		struct skb_frag_destructor *destructor;
+#endif
 	} page;
 #if (BITS_PER_LONG > 32) || (PAGE_SIZE >= 65536)
 	__u32 page_offset;
@@ -2028,6 +2054,48 @@ static inline struct page *skb_frag_page(const skb_frag_t *frag)
 	return frag->page.p;
 }
 
+#if 1 /* patchouli vrio-skbuff */
+
+/**
+* skb_frag_set_destructor - set destructor for a paged fragment
+* @skb: buffer containing fragment to be initialised
+* @i: paged fragment index to initialise
+* @destroy: the destructor to use for this fragment
+*
+* Sets @destroy as the destructor to be called when all references to
+* the frag @i in @skb (tracked over skb_clone, retransmit, pull-ups,
+* etc) are released.
+*
+* When a destructor is set then reference counting is performed on
+* @destroy->ref. When the ref reaches zero then @destroy->destroy
+* will be called. The caller is responsible for holding and managing
+* any other references (such a the struct page reference count).
+*
+* This function must be called before any use of skb_frag_ref() or
+* skb_frag_unref().
+*/
+static inline void skb_frag_set_destructor(struct sk_buff *skb, int i,
+                  struct skb_frag_destructor *destroy)
+{
+    skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+    frag->page.destructor = destroy;
+}
+
+static void skb_frag_destructor_ref(struct skb_frag_destructor *destroy)
+{
+	BUG_ON(destroy == NULL);
+	atomic_inc(&destroy->ref);
+}
+
+static void skb_frag_destructor_unref(struct skb_frag_destructor *destroy)
+{
+	if (destroy == NULL)
+		return;
+
+	if (atomic_dec_and_test(&destroy->ref))
+		destroy->destructor(destroy);
+}
+#endif
 /**
  * __skb_frag_ref - take an addition reference on a paged fragment.
  * @frag: the paged fragment
@@ -2036,6 +2104,12 @@ static inline struct page *skb_frag_page(const skb_frag_t *frag)
  */
 static inline void __skb_frag_ref(skb_frag_t *frag)
 {
+#if 1 /* patchouli vrio-skbuff */
+	if (unlikely(frag->page.destructor)) {
+		skb_frag_destructor_ref(frag->page.destructor);
+		return;
+	}
+#endif
 	get_page(skb_frag_page(frag));
 }
 
@@ -2059,6 +2133,12 @@ static inline void skb_frag_ref(struct sk_buff *skb, int f)
  */
 static inline void __skb_frag_unref(skb_frag_t *frag)
 {
+#if 1 /* patchouli vrio-skbuff */
+	if (unlikely(frag->page.destructor)) {
+		skb_frag_destructor_unref(frag->page.destructor);
+		return;
+    }
+#endif
 	put_page(skb_frag_page(frag));
 }
 
