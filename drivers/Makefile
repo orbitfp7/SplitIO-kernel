@@ -32,6 +32,9 @@ obj-y				+= amba/
 obj-$(CONFIG_DMADEVICES)	+= dma/
 
 obj-$(CONFIG_VIRTIO)		+= virtio/
+#if 1 /* patchouli vrio-makefile */
+obj-m				+= vrio/
+#endif
 obj-$(CONFIG_XEN)		+= xen/
 
 # regulators early, since some subsystems rely on them to initialize
