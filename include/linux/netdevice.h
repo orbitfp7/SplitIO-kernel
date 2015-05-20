@@ -1005,6 +1005,10 @@ struct net_device_ops {
 #ifdef CONFIG_NET_RX_BUSY_POLL
 	int			(*ndo_busy_poll)(struct napi_struct *dev);
 #endif
+#if 1 /* patchouli vrio-poll */
+    int (*ndo_poll)(struct net_device *dev, int budget);
+    void (*ndo_set_poll_mode)(struct net_device *dev, bool poll);
+#endif
 	int			(*ndo_set_vf_mac)(struct net_device *dev,
 						  int queue, u8 *mac);
 	int			(*ndo_set_vf_vlan)(struct net_device *dev,
