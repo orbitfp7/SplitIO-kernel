@@ -6,4 +6,7 @@ obj-m  += eth/
 
 obj-m  += generic/
 
+obj-m  += iohyp/sdev/
+obj-m  += ioguest/sdev/
+
 #endif
