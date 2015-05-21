@@ -12,4 +12,7 @@ obj-m  += ioguest/sdev/
 obj-m  += iohyp/net/
 obj-m  += ioguest/net/
 
+obj-m  += iohyp/blk/
+obj-m  += ioguest/blk/
+
 #endif
