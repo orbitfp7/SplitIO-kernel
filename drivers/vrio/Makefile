@@ -9,4 +9,7 @@ obj-m  += generic/
 obj-m  += iohyp/sdev/
 obj-m  += ioguest/sdev/
 
+obj-m  += iohyp/net/
+obj-m  += ioguest/net/
+
 #endif
