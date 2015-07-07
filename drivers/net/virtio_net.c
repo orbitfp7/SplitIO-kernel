@@ -37,7 +37,7 @@ module_param(gso, bool, 0444);
 
 /* FIXME: MTU in config. */
 #define MAX_PACKET_LEN (ETH_HLEN + VLAN_HLEN + ETH_DATA_LEN)
-#define GOOD_COPY_LEN	128
+#define GOOD_COPY_LEN	256
 
 #define VIRTNET_DRIVER_VERSION "1.0.0"
 
