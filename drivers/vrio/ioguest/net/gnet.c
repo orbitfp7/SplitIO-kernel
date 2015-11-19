@@ -812,14 +812,17 @@ static void remove_net_device(struct vrio_device *vdev)
     free_netdev(vi->dev);
 }
 
-static int __create_net_device(struct ioctl_create *create) {
+static int __create_net_device(struct ioctl_param *param) { 
+    struct ioctl_create *create = &param->x.create;
     int res;
 
     struct vrio_device *vdev;
     vdev = kmalloc(sizeof(*vdev), GFP_KERNEL);
 
-    vdev->placeholder.vrio_net_config = create->config.vrio_net;
-    vdev->config = &vdev->placeholder.vrio_net_config;
+    vdev->ioctl_param = *param;
+    vdev->config = &vdev->ioctl_param.x.create.config.vrio_net;
+//    vdev->placeholder.vrio_net_config = create->config.vrio_net;
+//    vdev->config = &vdev->placeholder.vrio_net_config;
     vdev->features = create->config.vrio_net.features;
 
     vdev->gsocket = (struct gsocket *)create->gsocket;
@@ -845,7 +848,7 @@ free_vdev:
 }
 
 static void __remove_net_device(struct vrio_device *vdev) {
-    trace("__remove_net_device");
+    mtrace("Destroying virtual network device frontend: %s", vdev->ioctl_param.x.create.device_path);
     list_del(&vdev->link);            
     remove_net_device(vdev);
     gfree_gsocket(vdev->gsocket);
@@ -853,6 +856,28 @@ static void __remove_net_device(struct vrio_device *vdev) {
 //    module_put(THIS_MODULE);
 }
 
+static struct vrio_device *get_net_device_by_backend(char *device_path) {
+    struct vrio_device *vdev;
+
+    list_for_each_entry(vdev, &devices_list, link) { 
+       if (!strncmp(vdev->ioctl_param.x.create.device_path, 
+                    device_path,
+                    sizeof(vdev->ioctl_param.x.create.device_path)))
+            return vdev;
+     }
+
+     return NULL;
+}
+
+static void remove_net_device_by_backend(char *device_path) {
+    struct vrio_device *vdev;
+
+    vdev = get_net_device_by_backend(device_path);
+    if (vdev)
+        __remove_net_device(vdev);
+}
+
+/*
 static void remove_net_device_by_index(int index) {
     struct vrio_device *vdev;
 
@@ -876,7 +901,7 @@ static void remove_net_device_by_uid(uint device_uid) {
         }
     }
 }
-
+*/
 static void remove_all_net_devices(void) {
     struct vrio_device *vdev, *n;
 
@@ -903,16 +928,19 @@ long ioctl(struct ioctl_param *local_param) {
     switch (local_param->cmd) {
         case VRIO_IOCTL_CREATE_NET: { 
             mtrace("ioctl VRIO_IOCTL_CREATE_NET");
-            __create_net_device(&local_param->x.create);
+            __create_net_device(local_param);
             break;
         }
         
         case VRIO_IOCTL_REMOVE_DEV: {
             mtrace("ioctl VRIO_IOCTL_REMOVE_DEV");
+            remove_net_device_by_backend(local_param->x.create.device_path);
+/*            
             if (local_param->x.remove.device_id == -1) 
                 remove_all_net_devices();
             else 
                 remove_net_device_by_index(local_param->x.remove.device_id);                
+*/
             break;
         }
 
