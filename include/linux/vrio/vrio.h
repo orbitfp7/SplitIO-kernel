@@ -2,7 +2,7 @@
 #ifndef _VRIO_H
 #define _VRIO_H
 
-#include "vrio_common.h"
+#include "generic_common.h"
 
 #define VRIO_HEADER_SIZE  (sizeof(struct vrio_header))
 #define VRIO_HEADER_DEBUG 0
@@ -19,10 +19,13 @@ struct vrio_device {
     struct gsocket *gsocket;
     ulong host_priv;
 
+    struct ioctl_param ioctl_param;    
+/*
     union {
         struct vrio_blk_config vrio_blk_config;
         struct vrio_net_config vrio_net_config;
     } placeholder;
+*/
 };
 
 struct vrio_header {

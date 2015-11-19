@@ -36,6 +36,7 @@ struct list_head {
 #define VIRTIO_BLK_F_WCE        9       /* Writeback mode enabled after reset */
 #define VIRTIO_BLK_F_TOPOLOGY   10      /* Topology information is available */
 #define VIRTIO_BLK_F_CONFIG_WCE 11      /* Writeback mode available in config */
+#define VIRTIO_BLK_F_DEV_NAME   12      /* Indicates block device name */
 
 /* The feature bitmap for virtio net */
 #define VIRTIO_NET_F_CSUM	0	/* Host handles pkts w/ partial csum */
@@ -66,6 +67,7 @@ struct list_head {
 #define VIRTIO_NET_S_ANNOUNCE	2	/* Announcement is needed */
 
 struct vrio_blk_config {
+    char device_name[64];
     ulong features;
     uint64_t capacity;
     uint32_t blk_size;

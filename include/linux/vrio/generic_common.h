@@ -49,6 +49,7 @@ struct ioctl_param {
     char device_name[32];
     char interface_name[32];
     char guest_mac_address[6];
+    __be32 guest_ip_address;
     uint cmd;
 
     union {
@@ -94,11 +95,12 @@ __maybe_unused static ulong calc_checksum(struct ioctl_param *param) {
 #define VRIO_IOCTL_CREATE_NET   2
 #define VRIO_IOCTL_REMOVE_DEV   3
 #define VRIO_IOCTL_HOST         4
+// #define VRIO_IOCTL_ACK          5
 
-#define VRIO_IOCTL_CREATE_SDEV  5
-#define VRIO_IOCTL_REQUEST_SDEV 6
+#define VRIO_IOCTL_CREATE_SDEV  6
+#define VRIO_IOCTL_REQUEST_SDEV 7
 
-#define VRIO_IOCTL_SANITY_CHECK 7
+#define VRIO_IOCTL_SANITY_CHECK 8
 
 
 #endif /* _GENERIC_H */

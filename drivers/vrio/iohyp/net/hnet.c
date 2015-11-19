@@ -65,6 +65,8 @@ module_param(VHOST_NET_WEIGHT, int, S_IRUGO);
 
 #define VHOST_DMA_IS_DONE(len) ((len) >= VHOST_DMA_DONE_LEN)
 
+static DEFINE_IDA(vhost_net_index_ida);
+
 enum {
     VHOST_NET_VQ_RX = 0,
     VHOST_NET_VQ_TX = 1,
@@ -91,6 +93,8 @@ struct vhost_device {
 
     struct gsocket *gsocket;
     ulong guest_priv;
+
+    struct ioctl_param ioctl_param;
 };
 
 struct vhost_net {
@@ -112,6 +116,14 @@ struct vhost_net {
     size_t sock_hlen;
 
     bool zcopy;
+
+    int index;
+    char stat_name[32];
+    struct dev_ext_attribute fs_device_attr;
+    atomic64_t stat_total_bytes_sent;
+    atomic64_t stat_total_bytes_received;
+    atomic64_t stat_total_packets_sent;
+    atomic64_t stat_total_packets_received;
 
 //    unsigned tx_packets;
 
@@ -454,7 +466,7 @@ __always_inline static int handle_tx(struct vhost_net *net, struct giovec *giove
         trace("calling zerocopy handle tx");
         return zerocopy_handle_tx(net, giovec, len);
     } else {
-        trace("calling tap handle tx");
+        trace("calling tap_handle tx");
         return __tap_handle_tx(net, giovec, len);
     }
 }
@@ -575,6 +587,9 @@ static void tap_handle_rx(struct vhost_net *net) {
             kfree_skb(skb);
             continue;
         }
+
+        atomic64_add(skb->len, &net->stat_total_bytes_received);
+        atomic64_inc(&net->stat_total_packets_received);
 
         skb_orphan(skb);
         nf_reset(skb);
@@ -848,6 +863,33 @@ static __always_inline int vhost_poll_start(struct vhost_net *vnet, struct file 
     return 0; 
 }
 
+
+static void fs_create_file(struct dev_ext_attribute *attr);
+static void fs_remove_file(struct dev_ext_attribute *attr);
+
+
+static ssize_t vhost_fs_device_get_stats(struct device *dir,
+                                         struct device_attribute *attr, 
+                                         char *buf) {
+    struct vhost_net *net = (struct vhost_net *)((struct dev_ext_attribute *)attr)->var;
+    struct ioctl_param *param = &net->vdev->ioctl_param;
+    ssize_t length = 0;
+
+    length = sprintf(buf, "%-18s%-18s%-18s%-18s%-18s\n"
+                          "%-18lu%-18lu%-18lu%-18s%d.%d.%d.%d\n",
+                          "Bytes_Sent", "Bytes_Received", "IO_Operations", "Backend_Device", "Guest_IP", 
+//    length = sprintf(buf, "Bytes Sent\tBytes Received\tI/O Operations\tBackend Device\tGuest IP\n" 
+//                          "%lu\t%lu\t%lu\t%s\t%d.%d.%d.%d\n", 
+        atomic64_read(&net->stat_total_bytes_sent),
+        atomic64_read(&net->stat_total_bytes_received),
+        atomic64_read(&net->stat_total_packets_sent) + atomic64_read(&net->stat_total_packets_received),
+        param->x.create.device_path,
+        NIPQUAD(param->guest_ip_address));
+
+    return length;
+}
+
+
 static long vhost_net_set_backend(struct vhost_net *net, struct file *file)
 {
     struct socket *sock;
@@ -989,6 +1031,12 @@ static int vhost_net_open(struct vhost_device *vdev)
         goto out;
     }
 
+    ret = ida_simple_get(&vhost_net_index_ida, 0, 0, GFP_KERNEL);
+    if (ret < 0) {
+        etrace("ida_simple_get failed");
+        goto out;
+    }
+    net->index = ret;
     net->vdev = vdev;    
     vhost_poll_init(net);
 
@@ -1028,6 +1076,7 @@ static int vhost_net_release(struct vhost_device *vdev)
     struct vhost_net *net = vdev->priv;
 
     vhost_poll_stop(net);
+    ida_simple_remove(&vhost_net_index_ida, net->index);
 
     if (vdev->file) {
         file_close(vdev->file);
@@ -1035,6 +1084,7 @@ static int vhost_net_release(struct vhost_device *vdev)
         vdev->sock = NULL;
     }
 
+    fs_remove_file(&net->fs_device_attr);
     kfree(net);
     return 0;
 }
@@ -1047,7 +1097,8 @@ static void __vhost_net_release(struct vhost_device *vdev) {
     kfree(vdev);
 }
 
-static int __vhost_net_create(struct ioctl_create *create) {
+static int __vhost_net_create(struct ioctl_param *param) {
+    struct ioctl_create *create = &param->x.create;
     struct vhost_device *vdev;
     struct vhost_net *vnet;
     struct file* file;
@@ -1067,6 +1118,7 @@ static int __vhost_net_create(struct ioctl_create *create) {
         res = -EFAULT;
         goto out_file;
     }
+    vdev->ioctl_param = *param;
 
     vnet = (struct vhost_net *)vdev->priv;
 
@@ -1086,6 +1138,20 @@ static int __vhost_net_create(struct ioctl_create *create) {
     trace("TX Zero copy used: %d", vnet->zcopy);
     vhost_poll_start(vnet, vnet->vdev->file);
     create->host_priv = (ulong)vnet;
+
+    sprintf(vnet->stat_name, "ndev%d", vnet->index);
+    vnet->fs_device_attr = (struct dev_ext_attribute){ .attr = { .attr = { .name = vnet->stat_name, 
+                                                                           .mode = S_IRUSR | S_IRGRP | S_IROTH }, 
+                                                                 .show = vhost_fs_device_get_stats, 
+                                                                 .store = NULL }, 
+                                                       .var = vnet };
+
+    atomic64_set(&vnet->stat_total_bytes_sent, 0);
+    atomic64_set(&vnet->stat_total_bytes_received, 0);
+    atomic64_set(&vnet->stat_total_packets_sent, 0);
+    atomic64_set(&vnet->stat_total_packets_received, 0);
+
+    fs_create_file(&vnet->fs_device_attr);
     return 0;
 
 out_net:
@@ -1096,6 +1162,28 @@ out:
     return res;
 }
 
+static struct vhost_device *get_net_device_by_backend(char *device_path) {
+    struct vhost_device *vdev;
+
+    list_for_each_entry(vdev, &devices_list, link) { 
+        if (!strncmp(vdev->ioctl_param.x.create.device_path, 
+                     device_path,
+                     sizeof(vdev->ioctl_param.x.create.device_path)))
+            return vdev;
+    }   
+
+    return NULL;
+}
+
+static void remove_net_device_by_backend(char *device_path) {
+    struct vhost_device *vdev;
+
+    vdev = get_net_device_by_backend(device_path);
+    if (vdev)
+        __vhost_net_release(vdev);
+}
+
+/*
 static void remove_net_device_by_index(int index) {
     struct vhost_device *vdev;
 
@@ -1119,6 +1207,7 @@ static void remove_net_device_by_uid(uint device_uid) {
         }
     }
 }
+*/
 
 static void remove_all_net_devices(void) {
     struct vhost_device *vdev, *n;
@@ -1141,17 +1230,37 @@ long ioctl(struct ioctl_param *local_param) {
     switch (local_param->cmd) {
         case VRIO_IOCTL_CREATE_NET: { 
             mtrace("ioctl VRIO_IOCTL_CREATE_NET");    
-            res = __vhost_net_create(&local_param->x.create);
+            if (get_net_device_by_backend(local_param->x.create.device_path)) {
+                mtrace("Backend network device \'%s\' is already attached", local_param->x.create.device_path);
+                res = -EFAULT;
+                break;
+            }
+            res = __vhost_net_create(local_param);
             break;
         }
         
         case VRIO_IOCTL_REMOVE_DEV: {
-            mtrace("ioctl VRIO_IOCTL_REMOVE_DEV");
+            struct vhost_device *vdev;
+            int i;
+
+            mtrace("ioctl VRIO_IOCTL_REMOVE_DEV (%s)", local_param->x.create.device_path);
+            vdev = get_net_device_by_backend(local_param->x.create.device_path);
+            if (vdev) {
+                local_param->guest_ip_address = vdev->ioctl_param.guest_ip_address;
+                memcpy(local_param->guest_mac_address, vdev->ioctl_param.guest_mac_address, 6); 
+                strcpy(local_param->interface_name, vdev->ioctl_param.interface_name);
+                __vhost_net_release(vdev);
+            }
+
+            res = vdev ? 0 : -EFAULT;
+            break;
+/*
             if (local_param->x.remove.device_id == -1) 
                 remove_all_net_devices();
             else 
                 remove_net_device_by_index(local_param->x.remove.device_id);
             break;
+*/
         }
 
         case VRIO_IOCTL_HOST: {
@@ -1219,6 +1328,9 @@ void handler(ulong param1, ulong param2) {
     }
 #endif
 
+    atomic64_add(vhdr->out_len, &net->stat_total_bytes_sent);
+    atomic64_inc(&net->stat_total_packets_sent);
+
 #if L2_MACVTAP_TX_SKB_BRIDGE
     if (use_tap_bridge) {
         if (tap_handle_tx(net, giovec)) {
@@ -1242,6 +1354,14 @@ static struct vdev vdev_net = {
     .ioctl = ioctl,
     .run_from_softirq_context = false,
 };
+
+static void fs_create_file(struct dev_ext_attribute *attr) {
+    fs_device_file_create(vdev_net.fs_dev, attr);
+}
+
+static void fs_remove_file(struct dev_ext_attribute *attr) {
+    fs_device_file_remove(vdev_net.fs_dev, attr);    
+}
 
 static int vhost_net_init(void)
 {

@@ -11,6 +11,7 @@
 #include <linux/miscdevice.h>
 #include <linux/fs.h>
 #include <linux/list.h>
+#include <linux/cpufreq.h>
 
 #include <asm/uaccess.h>
 
@@ -30,6 +31,13 @@ TRACE_ALL;
 #include <linux/vrio/cqueue.h>
 #include <linux/vrio/lmempool.h>
 
+static struct class  *fs_class;
+static struct device *fs_devices;
+
+#define MODULE_NAME               "vrio"
+#define FS_DIRECTORY_DEVICE       "dev"
+
+
 int unit_test = 0;
 module_param(unit_test, int, S_IRUGO);
 int work_queue_size = 256;
@@ -46,34 +54,37 @@ int contended_packets = 0;
 module_param(contended_packets, int, S_IWUSR | S_IRUGO);
 ////////////////////////////////////////////////////
 
-#define MEASURE_IOHYP_CYCLES 0 // 1
+#define MEASURE_IOHYP_CYCLES 1 // 1
 
 #if MEASURE_IOHYP_CYCLES 
-int is_using_rdtsc = 0;
+int is_using_rdtsc = 1;
 module_param(is_using_rdtsc, int, S_IWUSR | S_IRUGO);
 
-long iohyp_work_cycles = 0;
-module_param(iohyp_work_cycles, long, S_IWUSR | S_IRUGO);
+//long iohyp_work_cycles = 0;
+//module_param(iohyp_work_cycles, long, S_IWUSR | S_IRUGO);
 
-long iohyp_gpoll_cycles = 0;
-module_param(iohyp_gpoll_cycles, long, S_IWUSR | S_IRUGO);
+//long iohyp_gpoll_cycles = 0;
+//module_param(iohyp_gpoll_cycles, long, S_IWUSR | S_IRUGO);
 
-long iohyp_gpoll_loops = 0;
-module_param(iohyp_gpoll_loops, long, S_IWUSR | S_IRUGO);
+//long iohyp_gpoll_loops = 0;
+//module_param(iohyp_gpoll_loops, long, S_IWUSR | S_IRUGO);
 
-long iohyp_empty_loops = 0;
-module_param(iohyp_empty_loops, long, S_IWUSR | S_IRUGO);
+//long iohyp_empty_loops = 0;
+//module_param(iohyp_empty_loops, long, S_IWUSR | S_IRUGO);
 
 
-atomic64_t iohyp_work_cycles_t;
-atomic64_t iohyp_gpoll_cycles_t;
+//atomic64_t iohyp_work_cycles_t;
+//atomic64_t iohyp_gpoll_cycles_t;
 #endif
 
 bool iohyp_schedule_on_empty_loop = 0;
 module_param(iohyp_schedule_on_empty_loop, bool, S_IWUSR | S_IRUGO);
 
-#define CONTROL_PORT 0
+#define TCP_PORT 0
+#define CONTROL_PORT 1
 spinlock_t g_lock;
+
+bool generic_driver_registered = false;
 
 #define L2SOCKET_GWORK(l2socket) ((struct gwork_struct *)l2socket->buffer)
 
@@ -110,10 +121,12 @@ struct gsocket {
 struct generic {
     struct list_head devices_list;
 
+    data_handler                  tcp_handler;
     data_handler                  control_handler;
     data_handler                  handler;
     struct channel {
         struct raw_socket *raw_socket;    
+        struct l2socket *tcp_socket;
         struct l2socket *control_socket;
 
         char interface_name[64];
@@ -141,10 +154,20 @@ struct generic {
         struct list_head poll_interfaces;
 
         int core_id;
+        int physical_core_id;
         bool spinning_worker;
+
+        long iohyp_empty_loops;
+        long iohyp_gpoll_loops;
+        atomic64_t iohyp_work_cycles_t;
+        atomic64_t iohyp_gpoll_cycles_t;
+
+        char iocore_name[32];
+        struct dev_ext_attribute fs_iocore_attr;        
     } iocores[MAX_IO_CORES];
 
     atomic_t next_iocore;
+    struct device *fs_iocore_dev;
 
     int num_interface;
     char **interface_name;
@@ -235,7 +258,7 @@ __always_inline static int get_next_iocore_id(struct generic *generic, struct bs
 
     if (channel->nr_iocores == 0) {
         iocore = atomic_read(&generic->next_iocore) % generic->num_iocores;
-        trace("selected iocroe: %d", iocore);
+//1        trace("selected iocroe: %d", iocore);
     } else {
         iocore = channel->allowed_iocores[atomic_read(&generic->next_iocore) % channel->nr_iocores]; 
         trace("allowed cpu: %d", iocore);
@@ -568,9 +591,11 @@ __always_inline static long calculate_cycles(long s, long e) {
     return (e - s); 
 }
 
+/*
 int get_iocore(struct iocore *iocore) {
     return iocore->core_id;
 }
+*/
 
 #define ns_to_us(x) (x >> 10)
 #define us_to_ns(x) (x << 10)
@@ -622,8 +647,9 @@ repeat:
 #if MEASURE_IOHYP_CYCLES
         if (is_using_rdtsc) {
             e_cycles = get_cycles();
-            atomic64_add(calculate_cycles(s_cycles, e_cycles), &iohyp_work_cycles_t);
-            iohyp_work_cycles = atomic64_read(&iohyp_work_cycles_t);
+            atomic64_add(calculate_cycles(s_cycles, e_cycles), &iocore->iohyp_work_cycles_t);
+//            atomic64_add(calculate_cycles(s_cycles, e_cycles), &iohyp_work_cycles_t);
+//            iohyp_work_cycles = atomic64_read(&iohyp_work_cycles_t);
         }
 #endif
     } else { /* no work to-do */
@@ -635,18 +661,19 @@ repeat:
             total_rx_packets = gpoll(&iocore->poll_interfaces, poll_budget);
 #if MEASURE_IOHYP_CYCLES
             if (total_rx_packets)
-                iohyp_gpoll_loops++;
+                iocore->iohyp_gpoll_loops++;
 
             if (is_using_rdtsc && total_rx_packets) {
                 e_cycles = get_cycles();
-                atomic64_add(calculate_cycles(s_cycles, e_cycles), &iohyp_gpoll_cycles_t);
-                iohyp_gpoll_cycles = atomic64_read(&iohyp_gpoll_cycles_t);
+                atomic64_add(calculate_cycles(s_cycles, e_cycles), &iocore->iohyp_gpoll_cycles_t);
 
+//                atomic64_add(calculate_cycles(s_cycles, e_cycles), &iohyp_gpoll_cycles_t);
+//                iohyp_gpoll_cycles = atomic64_read(&iohyp_gpoll_cycles_t);
             }
 #endif            
             if (!total_rx_packets) {
 #if MEASURE_IOHYP_CYCLES
-                iohyp_empty_loops++;
+                iocore->iohyp_empty_loops++;
 #endif
                 if (iohyp_schedule_on_empty_loop)
                     schedule();
@@ -817,12 +844,24 @@ void __unregister(struct vdev *vdev) {
     }
 }
 
-bool vhost_register(struct vdev *vdev) {            
+
+static struct device *fs_dir_init(void *owner, 
+                                  struct device *parent,
+                                  const char *fmt, ...);
+
+static void fs_dir_exit(struct device *fs_dev);
+
+bool vhost_register(struct vdev *vdev) {
+    vdev->fs_dev = fs_dir_init(NULL, fs_devices, vdev->name);
+    atrace(vdev->fs_dev == NULL);
+
     return __register(&host, vdev);
 }
 EXPORT_SYMBOL(vhost_register);
 
 void vhost_unregister(struct vdev *vdev) {    
+    fs_dir_exit(vdev->fs_dev);
+
     __unregister(vdev);
 }
 EXPORT_SYMBOL(vhost_unregister);
@@ -847,6 +886,14 @@ struct channel *get_channel(struct generic *generic, unchar *interface_name) {
         }
     }
     
+    return NULL;
+}
+
+struct l2socket *get_tcp_socket(struct generic *generic, unchar *interface_name) {
+    struct channel *channel = get_channel(generic, interface_name);
+    if (channel)
+        return channel->tcp_socket;
+
     return NULL;
 }
 
@@ -945,6 +992,7 @@ bool __open_socket(struct channel *channel, struct generic *generic, char *inter
     atrace(channel->raw_socket == NULL, goto out);
 
     channel->nr_iocores = 0;
+    channel->tcp_socket = open_socket(channel->raw_socket, TCP_PORT, generic->tcp_handler, true);
     channel->control_socket = open_socket(channel->raw_socket, CONTROL_PORT, generic->control_handler, false);
     channel->control_socket->private_data2 = (ulong)channel;
     channel->control_socket->private_data3 = (ulong)generic;
@@ -989,6 +1037,71 @@ void close_sockets(struct generic *generic) {
     }
 }
 
+static ssize_t generic_fs_iocore_get_stats(struct device *dir,
+                                           struct device_attribute *attr, 
+                                           char *buf) {
+    struct iocore *iocore = (struct iocore *)((struct dev_ext_attribute *)attr)->var;
+    unsigned long cpufreq = cpufreq_get(iocore->physical_core_id) * 1000;
+    int cpu_util = 0;
+    ssize_t length = 0;
+    trace("querying cpu for frequency: %d", iocore->physical_core_id);
+
+//    static unsigned long last_jiffies = 0;
+//    static unsigned long last_cycles;
+
+//    unsigned long now_jiffies = jiffies;
+    unsigned long now_cycles = atomic64_read(&iocore->iohyp_work_cycles_t) + 
+                               atomic64_read(&iocore->iohyp_gpoll_cycles_t);
+/*    if (last_jiffies) {
+        unsigned long interval = now_jiffies - last_jiffies;
+        if (interval)
+             cpu_util = ((100 * (now_cycles - last_cycles)) / cpufreq)  / (interval / HZ);
+//        cpu_util += 1;
+    }
+    last_jiffies = now_jiffies;
+    last_cycles = now_cycles;
+*/
+    length = sprintf(buf, "%-22s%-22s%-30s%-22s%-22s%-22s%-22s%-22s%-22s%-22s\n"
+                          "%-22lu%-22s%-30d%-22lu%-22lu%-22lu%-22lu%-22lu%-22d%-22lu\n", 
+                          "CPU_frequency", "Spinning_Worker", "Number_of_Polled_Interfaces", "Empty_Loops", 
+                          "Poll_Loops", "Work_Cycles", "Poll_Cycles", "Total_Core_Cycles", "CPU_Utilization",
+                          "timestamp",
+        cpufreq,
+        iocore->spinning_worker == true ? "YES" : "NO",
+        atomic_read(&iocore->does_polling),
+        iocore->iohyp_empty_loops,
+        iocore->iohyp_gpoll_loops,
+        atomic64_read(&iocore->iohyp_work_cycles_t),
+        atomic64_read(&iocore->iohyp_gpoll_cycles_t),
+        now_cycles,
+        cpu_util,
+        jiffies);
+
+    return length;
+}
+
+void create_iocores_sysfs_dir(struct generic *generic) {
+    int i;
+
+    for (i=0; i<generic->num_iocores; i++) {
+        sprintf(generic->iocores[i].iocore_name, "iocore%d", generic->iocores[i].physical_core_id); // core_id+1); // t_core);        
+        generic->iocores[i].fs_iocore_attr = (struct dev_ext_attribute){ .attr = { .attr = { .name = generic->iocores[i].iocore_name, 
+                                                                                             .mode = S_IRUSR | S_IRGRP | S_IROTH }, 
+                                                                                   .show = generic_fs_iocore_get_stats, 
+                                                                                   .store = NULL }, 
+                                                                         .var = &generic->iocores[i] };
+        fs_device_file_create(generic->fs_iocore_dev, &generic->iocores[i].fs_iocore_attr);
+    }
+}
+
+void remove_iocores_sysfs_dir(struct generic *generic) {
+    int i;
+
+    for (i=0; i<generic->num_iocores; i++) {
+        fs_device_file_remove(generic->fs_iocore_dev, &generic->iocores[i].fs_iocore_attr);
+    }
+}
+
 bool open_iocores(struct generic *generic) {
     int i, t_core;
 
@@ -1006,14 +1119,22 @@ bool open_iocores(struct generic *generic) {
             generic->iocores[i].spinning_worker = (t_core < 0);
 
             t_core = abs(t_core) - 1;
+            generic->iocores[i].physical_core_id = t_core;
+
             trace("setting thread affinity to %d", t_core);
             kthread_bind(generic->iocores[i].user_thread, t_core);
         } else {
             generic->iocores[i].spinning_worker = false;
+//            ntrace("DEPRECATED");
         }
 
         INIT_LIST_HEAD(&generic->iocores[i].poll_interfaces);
         atomic_set(&generic->iocores[i].does_polling, 0);
+
+        generic->iocores[i].iohyp_empty_loops = 0;
+        generic->iocores[i].iohyp_gpoll_loops = 0;
+        atomic64_set(&generic->iocores[i].iohyp_work_cycles_t, 0);
+        atomic64_set(&generic->iocores[i].iohyp_gpoll_cycles_t, 0);
         
         trace("iocore's thread: %p, core: %d", generic->iocores[i].user_thread, t_core);
         wake_up_process(generic->iocores[i].user_thread);
@@ -1039,7 +1160,11 @@ void close_iocores(struct generic *generic) {
     }
 }
 
-struct gsocket *galloc_gsocket(struct l2socket *l2socket, unsigned char *mac_address, unsigned char port) 
+//struct gsocket *galloc_gsocket(struct l2socket *l2socket, struct tcpsocket *tcpsocket, unsigned char *mac_address, unsigned char port) 
+struct gsocket *galloc_gsocket(struct l2socket *l2socket, 
+                               unsigned char *mac_address, unsigned char port,
+                               __u32 ip,
+                               __be16 tcp_port) 
 {
     struct gsocket *gsocket;
 
@@ -1049,11 +1174,14 @@ struct gsocket *galloc_gsocket(struct l2socket *l2socket, unsigned char *mac_add
         gsocket->bsocket.l2socket = l2socket; 
         init_l2address(&gsocket->bsocket.l2address, 
                        mac_address, 
-                       port);
+                       port, ip, tcp_port);
     }
 
     return gsocket;
 }
+
+//struct gsocket *galloc_gsocket(struct l2socket *l2socket, struct l2address *l2address, unsigned char *mac_address, unsigned char port) {
+//}
 
 void h_control_handler(struct bsocket *bsocket, struct biovec* biovec) {
 //void h_control_handler(ulong param1, ulong param2) {
@@ -1066,16 +1194,45 @@ void h_control_handler(struct bsocket *bsocket, struct biovec* biovec) {
     ret = memcpy_fromiovecend_skip((char *)&local_param, biovec->iov, biovec->iov_len, sizeof(struct ioctl_param));
     atrace(ret != 0);
 
+//    if (local_param.cmd == 30) {
+//        static int times=0;
+//
+//        if (times < 2)
+//            send_buff(bsocket, (char *)&local_param, sizeof(struct ioctl_param));
+//        times++;
+//    }
+
     if (local_param.cmd == VRIO_IOCTL_HOST) {
         trace("guest MAC address: %.*b", 6, bsocket->l2address.mac_address);
-        local_param.x.create.gsocket = (ulong)galloc_gsocket(bsocket->l2socket,
+        local_param.x.create.gsocket = (ulong)galloc_gsocket(
+            get_vdev_l2socket(&host, 
+                    local_param.device_name, 
+                    get_l2socket_if_name(bsocket->l2socket)),  
+ // bsocket->l2socket,
+//            &bsocket->l2address.tcpsocket,
             bsocket->l2address.mac_address, 
-            local_param.x.create.guest_port);
+            local_param.x.create.guest_port,
+            bsocket->l2address.ip_addr,
+            bsocket->l2address.tcp_port);
 
         trace("host gsocket: %p / guest_port: %d", local_param.x.create.gsocket, 
             local_param.x.create.guest_port);
         
-        dispatch_ioctl(&host, &local_param);    
+        dispatch_ioctl(&host, &local_param);
+
+
+//        local_param.cmd = 30;
+//        trace("sending packet to guest a30a");
+//        send_buff(bsocket, (char *)&local_param, sizeof(struct ioctl_param));
+//        send_buff(bsocket, (char *)&local_param, sizeof(struct ioctl_param));
+        //send_buff(bsocket, (char *)&local_param, sizeof(struct ioctl_param));
+
+//
+//        local_param.cmd = VRIO_IOCTL_ACK;
+//        bsocket->l2address.tcpsocket.type = 3;
+//        trace("VRIO_IOCTL_HOST, sending ACK");
+//        send_buff(bsocket, (char *)&local_param, sizeof(struct ioctl_param));
+//          
     } else {
         trace("ioctl: no such command");            
     }
@@ -1087,16 +1244,24 @@ void sanity_check(struct generic *generic);
 
 //void g_control_handler(ulong param1, ulong param2) {
 void g_control_handler(struct bsocket *bsocket, struct biovec* biovec) {
-//    struct bsocket *bsocket = (struct bsocket *)param1;
-//    struct biovec *biovec = (struct biovec *)param2;
     struct ioctl_param local_param;
     int ret;
     trace("g_control_handler_work");
 
+//    free_packet(bsocket, biovec);
+//    return;
+	
     ret = memcpy_fromiovecend_skip((char *)&local_param, biovec->iov, biovec->iov_len, sizeof(struct ioctl_param));
     atrace(ret != 0, return);
 
     switch (local_param.cmd) {
+        case 30: {
+//            msleep(100);
+//            trace("sending packet back");
+//            send_buff(bsocket, (char *)&local_param, sizeof(struct ioctl_param));
+//            send_buff(bsocket, (char *)&local_param, sizeof(struct ioctl_param));
+            break;
+        }
         case VRIO_IOCTL_CREATE_SDEV:
         case VRIO_IOCTL_CREATE_NET:                                             
         case VRIO_IOCTL_CREATE_BLK: {
@@ -1104,8 +1269,11 @@ void g_control_handler(struct bsocket *bsocket, struct biovec* biovec) {
                 get_vdev_l2socket(&guest, 
                     local_param.device_name, 
                     get_l2socket_if_name(bsocket->l2socket)),  
-                bsocket->l2address.mac_address, 
-                local_param.x.create.host_port);
+                // &bsocket->l2address.tcpsocket, 
+		bsocket->l2address.mac_address, 
+                local_param.x.create.host_port,
+                bsocket->l2address.ip_addr,
+                bsocket->l2address.tcp_port);
 
             trace("guest gsocket: %p / host_port: %d", local_param.x.create.gsocket, 
                 local_param.x.create.host_port);
@@ -1133,11 +1301,33 @@ void g_control_handler(struct bsocket *bsocket, struct biovec* biovec) {
             get_l2socket_if_name(bsocket->l2socket));
         
         local_param.cmd = VRIO_IOCTL_HOST;
-        
+//        bsocket->l2address.tcpsocket.type = 4; // 2
+//	atomic_set(&bsocket->l2address.tcpsocket.seq, 1);
         trace("VRIO_IOCTL_CREATE_NET, sending guest_priv: %lp", local_param.x.create.guest_priv);
         send_buff(bsocket, (char *)&local_param, sizeof(struct ioctl_param));
     }
 
+    free_packet(bsocket, biovec);
+}
+
+struct l2address g_l2address;
+bool g_flag = false;
+
+void h_tcp_handler(struct bsocket *bsocket, struct biovec* biovec) {
+    trace("h_tcp_handler");
+
+    g_l2address = bsocket->l2address;
+    g_flag = true;
+    free_packet(bsocket, biovec);
+}
+
+void g_tcp_handler(struct bsocket *bsocket, struct biovec* biovec) {
+    trace("g_tcp_handler");
+
+    trace("sending 2nd packet handshake");
+//    bsocket->l2address.tcpsocket.type = 2;
+    send_buff(bsocket, NULL, 0);
+ 
     free_packet(bsocket, biovec);
 }
 
@@ -1155,25 +1345,59 @@ static int generic_close(struct inode *inode, struct file *file) {
     return 0;
 }
 
+//#define QUADIP(a,b,c,d) \
+//    ((d&0xFF) << 24 | (c&0xFF) << 16 | (b&0xFF) << 8 | (a&0xFF))
+
 static int remote_ioctl(struct ioctl_param *ioctl_param) {
-    int ret = 0;
     struct l2address l2address;
     struct l2socket *l2socket;
+    int ret = 0;
                 
-    trace("remote mac address: %.*b", 6, ioctl_param->guest_mac_address);
-    init_l2address(&l2address, (unchar *)ioctl_param->guest_mac_address, CONTROL_PORT);            
-    l2socket = get_control_socket(&host, ioctl_param->interface_name);            
+    trace("remote mac address: %.*b, ip address: %d.%d.%d.%d", 
+        6, ioctl_param->guest_mac_address, 
+        NIPQUAD(ioctl_param->guest_ip_address));
+//    init_l2address(&l2address, (unchar *)ioctl_param->guest_mac_address, CONTROL_PORT);
+    init_l2address(&l2address, (unchar *)ioctl_param->guest_mac_address, 
+        TCP_PORT, ioctl_param->guest_ip_address, 0);
+//1    init_l2address(&l2address, (unchar *)ioctl_param->guest_mac_address, 
+//1        TCP_PORT, QUADIP(10,0,0,245), 0);
+//
+//    l2socket = get_control_socket(&host, ioctl_param->interface_name);            
+    l2socket = get_tcp_socket(&host, ioctl_param->interface_name);            
     if (l2socket) {
-        ret = __send_buff(l2socket, (char *)ioctl_param, sizeof(struct ioctl_param), &l2address);        
+        ret = __send_buff(l2socket, (char *)ioctl_param, 0, &l2address);        
         trace("__send_buff: %d", ret);
     }
-    
-    return ret;
+   
+//	return ret;
+ 
+    msleep(1000);
+    if (g_flag == false) {
+        etrace("g_flag is false");
+        return -1;
+    }
+
+//    g_l2address.tcpsocket.type = 3;
+    g_l2address.port = CONTROL_PORT;
+    l2socket = get_control_socket(&host, ioctl_param->interface_name);
+    if (l2socket) {
+        ret = __send_buff(l2socket, (char *)ioctl_param, sizeof(struct ioctl_param), &g_l2address);
+        trace("__send_buff: %d", ret);
+    }
+
+    return 0; // ret;
 }
 
 void sanity_check_work(struct gwork_struct *gwork) {
     mtrace("sanity_check_work");
 }
+
+void trace_biovec(struct biovec *biovec);
+
+void trace_giovec(struct giovec *giovec) {
+    trace_biovec((struct biovec *)giovec);
+}
+EXPORT_SYMBOL(trace_giovec);
 
 void sanity_check_generic(struct generic *generic) {
     int i;
@@ -1228,6 +1452,93 @@ void sanity_check(struct generic *generic) {
     mtrace("sanity_check");
     sanity_check_generic(generic);
 }
+
+void fs_device_file_create(struct device *fs_dev, struct dev_ext_attribute *attr) {
+    int res;
+    trace("creating file %s.\n", attr->attr.attr.name);
+    
+    res = device_create_file(fs_dev, &attr->attr);
+    if (res < 0){
+        WARN(res < 0, "couldn't create class file %s, err = %d.\n",
+                    attr->attr.attr.name, res);
+        trace("DONE - ERROR.");
+        return;
+    }
+}
+EXPORT_SYMBOL(fs_device_file_create);
+
+void fs_device_file_remove(struct device *fs_dev, struct dev_ext_attribute *attr) {
+    trace("removing file %s.\n", attr->attr.attr.name); 
+    device_remove_file(fs_dev, &attr->attr);
+}
+EXPORT_SYMBOL(fs_device_file_remove);
+
+static struct device *fs_dir_init(void *owner, 
+                                  struct device *parent,
+                                  const char *fmt, ...) {
+    struct device *fs_dev;
+    va_list vargs;
+    trace("START.");
+
+    va_start(vargs, fmt);
+    fs_dev = device_create_vargs(fs_class, parent, (dev_t)0,
+                                 owner, fmt, vargs);
+    va_end(vargs);
+
+    if (IS_ERR(fs_dev)) {
+        etrace("Failed to create directory %s", fmt);
+        return NULL;
+    }
+
+    trace("DONE.");
+    return fs_dev;
+}
+
+static void fs_dir_exit(struct device *fs_dev) {
+    trace("START.");
+    if (!fs_dev)
+        return;
+    // Releasing the device directory
+    trace("Releasing the device directory.");
+    // vhost_printk("Decrement reference count to device object.");
+    // put_device(vhost_fs_dev);
+    trace("Unregistering the device.");
+    device_unregister(fs_dev);
+    trace("DONE.");
+}
+
+static void vhost_fs_init(void) {
+    trace("START.");
+
+    // create the vhost class
+    trace("create the vhost class.");
+    fs_class = class_create(THIS_MODULE, MODULE_NAME);
+    if (IS_ERR(fs_class)) {
+        WARN(IS_ERR(fs_class), "couldn't create class, err = %ld\n",
+             PTR_ERR(fs_class));
+        return;
+    }
+
+    // add device directory
+    trace("add devices directory.");
+    fs_devices = fs_dir_init(NULL, NULL, "%s", FS_DIRECTORY_DEVICE);
+
+    trace("DONE.");
+}
+
+static void vhost_fs_exit(void) {
+    trace("START.");
+
+    // Remove devices directory
+    trace("Remove devices directory.");
+    fs_dir_exit(fs_devices);
+
+    trace("Destroy the vhost fs class.");
+    if (fs_class)
+        class_destroy(fs_class);
+    trace("DONE.");
+}
+
 /*
 struct ioctl_param g_local_param;
 
@@ -1236,6 +1547,7 @@ void remote_ioctl_work(ulong param1, ulong param2) {
     remote_ioctl(&g_local_param);
 }
 */
+
 static long generic_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param) {
     long ret = 0;
     struct ioctl_param local_param;
@@ -1263,7 +1575,7 @@ static long generic_ioctl(struct file *file, unsigned int ioctl_num, unsigned lo
 //                if (local_param.interface_name[0] == '-')
 //                    add_polling_interface(&poll_interfaces, local_param.interface_name + 1);                
 //            }
-            remote_ioctl(&local_param);
+            ret = remote_ioctl(&local_param);
             break;                     
         }
 
@@ -1273,8 +1585,13 @@ static long generic_ioctl(struct file *file, unsigned int ioctl_num, unsigned lo
 //                if (local_param.interface_name[0] == '-')
 //                    add_polling_interface(&poll_interfaces, local_param.interface_name + 1);                
 //            }
-            dispatch_ioctl(&host, &local_param);                       
-            remote_ioctl(&local_param);
+            ret = dispatch_ioctl(&host, &local_param);
+            if (ret) {
+                etrace("dispatch_ioctl failed");
+                break;
+            }
+
+            ret = remote_ioctl(&local_param);
             break;                            
         }
         case GENERIC_IOCTL_IOCORE: {
@@ -1381,11 +1698,13 @@ static int __init generic_init(void) {
 
 //    INIT_LIST_HEAD(&poll_interfaces);
 //    atomic_set(&does_polling, 0);
-#if MEASURE_IOHYP_CYCLES
-    atomic64_set(&iohyp_work_cycles_t, 0);
-    atomic64_set(&iohyp_gpoll_cycles_t, 0);
-#endif
+//#if MEASURE_IOHYP_CYCLES
+//    atomic64_set(&iohyp_work_cycles_t, 0);
+//    atomic64_set(&iohyp_gpoll_cycles_t, 0);
+//#endif
     INIT_LIST_HEAD(&host.devices_list);
+    host.tcp_handler      = h_tcp_handler;
+    trace("hTCP handler: %lp", h_tcp_handler);
     host.control_handler  = h_control_handler;
     host.handler          = h_socket_handler;
     host.num_interface    = h_eth_name_argc;
@@ -1395,6 +1714,8 @@ static int __init generic_init(void) {
     atomic_set(&host.next_iocore, 0);
 
     INIT_LIST_HEAD(&guest.devices_list);
+    guest.tcp_handler     = g_tcp_handler;
+    trace("gTCP handler: %lp", g_tcp_handler);
     guest.control_handler = g_control_handler;
     guest.handler         = g_socket_handler;
     guest.num_interface   = g_eth_name_argc;
@@ -1426,6 +1747,7 @@ static int __init generic_init(void) {
             etrace("Registration failed");
             goto out_close_guest_iocore;
         }
+        generic_driver_registered = true;
 
         mtrace("misc driver registerd successfully");
         
@@ -1438,6 +1760,13 @@ static int __init generic_init(void) {
             etrace("host open_iocores failed");        
             goto out_close_host;
         }
+
+        vhost_fs_init();
+
+        host.fs_iocore_dev = fs_dir_init(NULL, fs_devices, "core");
+        atrace(host.fs_iocore_dev == NULL);
+
+        create_iocores_sysfs_dir(&host);        
     }
 
     return 0;
@@ -1459,9 +1788,14 @@ static void __exit generic_exit(void) {
 
     close_iocores(&host);
     close_iocores(&guest);
-    if (host.num_interface > 0) {
+    if (generic_driver_registered) { // host.num_interface > 0) {
         misc_deregister(&generic_misc);
         remove_all_polling_interfaces(&host);
+
+        remove_iocores_sysfs_dir(&host);
+        fs_dir_exit(host.fs_iocore_dev);    
+
+        vhost_fs_exit();
     }
     close_sockets(&host);
     close_sockets(&guest);

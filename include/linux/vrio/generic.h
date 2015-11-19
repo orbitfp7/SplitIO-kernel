@@ -33,6 +33,7 @@ struct vdev {
     long (*ioctl) (struct ioctl_param *ioctl_param); 
     bool run_from_softirq_context;
 
+    struct device *fs_dev;
     struct l2socket *l2sockets[MAX_ETH_COUNT];
     int l2sockets_nr;
 };
@@ -99,6 +100,10 @@ static __always_inline int zgsend_iov(struct gsocket *gsocket, struct iovec *iov
 }
 
 bool queue_gwork(struct gsocket *gsocket, struct gwork_struct *gwork);
+
+void fs_device_file_create(struct device *fs_dev, struct dev_ext_attribute *attr);
+void fs_device_file_remove(struct device *fs_dev, struct dev_ext_attribute *attr);
+
 
 // For debug only
 void trace_gsocket(struct gsocket *gsocket);

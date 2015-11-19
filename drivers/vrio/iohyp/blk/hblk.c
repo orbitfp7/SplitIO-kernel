@@ -2,6 +2,8 @@
 /*
  * vRIO-block server in host kernel.
  */
+#include <crypto/aes.h>
+#include <linux/crypto.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/vhost.h>
@@ -20,8 +22,10 @@
 
 TRACE_ALL;
 
+#define ENCRYPT 1
+
 #include <linux/vrio/cqueue.h>
-#include <linux/vrio/lmempool.h>
+#include <linux/vrio/cmempool.h>
 
 #define SECTOR_SHIFT  9
 #define SECTOR_SIZE   (1 << SECTOR_SHIFT)
@@ -105,21 +109,29 @@ struct vhost_device {
     void *priv;
 
     struct file *file;
+
+    struct ioctl_param ioctl_param;   
 };
 
 struct vhost_blk {
     /* this member must be first */
     struct giocore giocore;
     struct vhost_device *vdev;
-    struct lmempool lmempool;
+    struct cmempool cmempool;
     struct llist_head llhead;
 //    atomic_t host_work_posted;
     struct gwork_struct host_kick_work;
     u16 reqs_nr;
     int index;
 
+    struct dev_ext_attribute fs_device_attr;
+
+    char stat_name[32];
+    atomic64_t stat_total_bytes_read;
+    atomic64_t stat_total_bytes_written;
+
+    atomic64_t stat_total_reqs;
 #if TRACE_DEBUG
-    int stat_total_reqs;
     atomic_t stat_outstanding_reqs;
     int stat_max_outstanding_reqs;
     int stat_max_batched_responses;
@@ -158,7 +170,7 @@ static __always_inline int vhost_blk_set_status(struct vhost_blk_req *req, u8 st
 static __always_inline struct vhost_blk_req *vhost_alloc_req(struct vhost_blk *blk) {
     struct vhost_blk_req *req;
 
-    req = lmempool_alloc(&blk->lmempool);
+    req = cmempool_alloc(&blk->cmempool);
     if (!req) {
         etrace("mempool_alloc failed");
         return NULL;
@@ -170,8 +182,8 @@ static __always_inline struct vhost_blk_req *vhost_alloc_req(struct vhost_blk *b
     req->iov_pages = 0;
 #endif
 
+    atomic64_inc(&blk->stat_total_reqs);
 #if TRACE_DEBUG
-    blk->stat_total_reqs++;
     atomic_inc(&blk->stat_outstanding_reqs);
     blk->stat_max_outstanding_reqs = max(blk->stat_max_outstanding_reqs, 
                                          atomic_read(&blk->stat_outstanding_reqs));
@@ -187,7 +199,7 @@ static __always_inline void vhost_free_req(struct vhost_blk_req *req) {
     if (req->giovec)
         gfree_packet(req->gsocket, req->giovec);
     trace("vhost_free_req 2");
-    lmempool_free(&blk->lmempool, req);
+    cmempool_free(&blk->cmempool, req);
     trace("vhost_free_req 3");
 
 #if TRACE_DEBUG
@@ -234,6 +246,8 @@ static void vhost_blk_req_done(struct bio *bio, int err)
     struct vhost_blk *blk = req->blk;    
     bool ret;
 
+//1    trace("vhost_blk_req_done");
+
     if (err)
         req->len = err;
 
@@ -246,6 +260,40 @@ static void vhost_blk_req_done(struct bio *bio, int err)
 
     bio_put(bio);
 }
+
+#if ENCRYPT
+void encrypt(char *buff, int size, u8 *key1) {
+    struct crypto_cipher *tfm;
+    char aes_block[AES_BLOCK_SIZE];
+    int i, count;
+
+    count = size / AES_BLOCK_SIZE;
+    tfm = crypto_alloc_cipher("aes", 0, 16);
+    crypto_cipher_setkey(tfm, key1, 16);
+    for (i = 0; i < count; i++) {
+        memcpy(aes_block, buff, AES_BLOCK_SIZE);
+        crypto_cipher_encrypt_one(tfm, buff, aes_block);
+        buff = buff + AES_BLOCK_SIZE;
+    }
+    crypto_free_cipher(tfm);
+}  
+
+void decrypt(char *buff, int size, u8 *key1) {
+    struct crypto_cipher *tfm;
+    char aes_block[AES_BLOCK_SIZE];
+    int i, count;
+
+    count = size / AES_BLOCK_SIZE;
+    tfm = crypto_alloc_cipher("aes", 0, 16);
+    crypto_cipher_setkey(tfm, key1, 16);
+    for (i = 0; i < count; i++) {
+        memcpy(aes_block, buff, AES_BLOCK_SIZE);
+        crypto_cipher_decrypt_one(tfm, buff, aes_block);
+        buff = buff + AES_BLOCK_SIZE;
+    }  
+    crypto_free_cipher(tfm);   
+} 
+#endif 
 
 static __always_inline struct page *vaddr_to_page(void *vaddr) 
 {
@@ -423,6 +471,9 @@ static __always_inline int vhost_bio_add_page(struct       vhost_blk_req *req,
     struct page *page;
     struct bio *bio;
 
+#if ENCRYPT
+    encrypt(bpage, len, "ABCDEFGHIJKLMNOPQ");
+#endif
     page = vaddr_to_page(bpage);
     atrace(page == NULL, return -EFAULT);
 
@@ -476,7 +527,8 @@ static int vhost_blk_bio_make_aligned(struct vhost_blk_req *req,
 
     if (unlikely(req->write == WRITE_FLUSH)) {
         struct bio *bio = bio_alloc(GFP_KERNEL, 1);
-        trace("WRITE_FLUSH");
+        static int flush_id = 0;
+        trace("WRITE_FLUSH (%d)", ++flush_id);
 
         if (!bio) {
             etrace("bio_alloc failed");
@@ -493,16 +545,17 @@ static int vhost_blk_bio_make_aligned(struct vhost_blk_req *req,
     }
 
     while (out_len) {
-            if (unlikely(iov->iov_len == 0)) {
+            if (iov->iov_len == 0) {
                 --iov_len;
                 ++iov;
                 continue;
             }
             
             off = (ulong)iov->iov_base & ~PAGE_MASK;
-            plen = PAGE_SIZE - off;
-            if (plen > iov->iov_len)
-                plen = iov->iov_len;
+            plen = iov->iov_len;
+//            plen = PAGE_SIZE - off;
+//            if (plen > iov->iov_len)
+//                plen = iov->iov_len;
             alen = plen & SECTOR_MASK;
             trace("off: %d, plen: %d, alen: %d", off, plen, alen);
             trace("iov->iov_len: %d", iov->iov_len);
@@ -521,7 +574,7 @@ static int vhost_blk_bio_make_aligned(struct vhost_blk_req *req,
   
             if (plen & ~SECTOR_MASK) {
                 ret = memcpy_fromiovecend_skip(aligned_buffer, iov, iov_len, SECTOR_SIZE);
-                atrace(ret != 0, return false);
+                atrace(ret != 0, goto fail);
 
                 off = (ulong)aligned_buffer & ~PAGE_MASK;
                 ret = vhost_bio_add_page(req, bdev, pages_nr_total, aligned_buffer, SECTOR_SIZE, off, bio_nr);
@@ -577,6 +630,8 @@ static __always_inline void vhost_blk_bio_send(struct vhost_blk_req *req)
 {
     struct blk_plug plug;
     int i, bio_nr;
+
+    trace("vhost_blk_bio_send");
 
     bio_nr = atomic_read(&req->bio_nr);
     blk_start_plug(&plug);
@@ -675,6 +730,8 @@ static int vhost_blk_req_handle(struct vhost_blk_req *req,
     return ret;
 }
 
+void trace_giovec(struct giovec *giovec);
+
 /* Guest kick us for I/O submit */
 static void vhost_blk_handle_guest_kick(struct gsocket *gsocket, struct vhost_blk *blk, 
                                         struct vrio_header *vhdr, struct giovec* giovec)
@@ -753,7 +810,9 @@ static void vhost_blk_handle_guest_kick(struct gsocket *gsocket, struct vhost_bl
     }
 
     if (vhost_blk_req_handle(req, &hdr, f) < 0) {
-        etrace("vhost_blk_req_handle failed");
+        etrace("vhost_blk_req_handle failed (hdr.type: %d O: %d/ I: %d/ F: %d)", 
+            hdr.type, VIRTIO_BLK_T_OUT, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_FLUSH);
+        trace_giovec(giovec);
         vrio_discard_req(req);
     }
 }
@@ -837,12 +896,12 @@ static __always_inline int __map_blk_response(struct vhost_blk_req *new_req, str
     vhdr->out_len = new_req->vhdr->in_len;
     vhdr->in_len = 0;
 
-    trace("map_blk_response %d", vhdr->out_len);
+//    trace("map_blk_response %d", vhdr->out_len);
 
     vhdr->host_priv  = new_req->vhdr->host_priv;
     vhdr->guest_priv = new_req->vhdr->guest_priv;
     vhdr->id         = new_req->vhdr->id;
-
+    trace("vhdr->id: %d (blkid), vhdr->out_len: %d", vhdr->id, vhdr->out_len);
 //    iov[0].iov_base = req->vhdr;
 //    iov[0].iov_len = sizeof(struct vrio_header);
 
@@ -941,6 +1000,18 @@ static void vhost_blk_handle_host_kick(struct gwork_struct *gwork)
             continue;
         }
 
+        if (status == VIRTIO_BLK_S_OK) {
+#if ENCRYPT
+            if (req->write == READ)        
+                decrypt(req->in_buff, req->vhdr->in_len - 1, "ABCDEFGHIJKLMNOPQ");
+#endif
+
+            if (req->write == READ)
+                atomic64_add(req->len, &blk->stat_total_bytes_read);
+            else
+                atomic64_add(req->len, &blk->stat_total_bytes_written);
+        }
+
         if (debug_batch_responses) {
             if (map_blk_response(batch_req, req)) {
 #if TRACE_DEBUG
@@ -1007,9 +1078,39 @@ static void vhost_blk_handle_host_kick(struct gwork_struct *gwork)
 }
 #endif
 
+
+static void fs_create_file(struct dev_ext_attribute *attr);
+static void fs_remove_file(struct dev_ext_attribute *attr);
+
+
+static ssize_t vhost_fs_device_get_stats(struct device *dir,
+                                         struct device_attribute *attr, 
+                                         char *buf) {
+    struct vhost_blk *blk = (struct vhost_blk *)((struct dev_ext_attribute *)attr)->var;
+    struct ioctl_param *param = &blk->vdev->ioctl_param;
+    ssize_t length = 0;
+
+    length = sprintf(buf, "%-22s%-22s%-22s%-22s%-22s%-22s%-150s%-22s\n"
+                          "%-22lu%-22lu%-22lu%-22lu%-22lu%-22s%-150s%d.%d.%d.%d\n", 
+                          "timestamp", "Bytes_Written", "Bytes_Read", "IO_Operations", "Capacity", 
+                          "Guest_Device_Name", "Backend_Device_Path", "Guest_IP_Address",
+//    length = sprintf(buf, "Bytes Written\tBytes Read\tI/O Operations\tCapacity\tGuest Device Name\tBackend Device Path\tGuest IP Address\n"
+//                          "%lu\t%lu\t%lu\t%lu\t%s\t%s\t%d.%d.%d.%d\n", 
+        jiffies,
+        atomic64_read(&blk->stat_total_bytes_written),
+        atomic64_read(&blk->stat_total_bytes_read),
+        atomic64_read(&blk->stat_total_reqs),
+        param->x.create.config.vrio_blk.capacity,
+        param->x.create.config.vrio_blk.device_name,
+        param->x.create.device_path,
+        NIPQUAD(param->guest_ip_address));
+
+    return length;
+}
+
 static int vhost_blk_setup(struct vhost_blk *blk)
 {
-    if (init_lmempool(&blk->lmempool, num_outstanding_reqs, sizeof(struct vhost_blk_req)) == false) {
+    if (init_cmempool(&blk->cmempool, num_outstanding_reqs, sizeof(struct vhost_blk_req)) == false) {
         etrace("init_mempool failed");
         return -ENOMEM;
     }
@@ -1068,7 +1169,8 @@ static int vhost_blk_release(struct vhost_device *vdev)
         vdev->file = NULL;
     }
 
-    done_lmempool(&blk->lmempool);
+    done_cmempool(&blk->cmempool);
+    fs_remove_file(&blk->fs_device_attr);    
     kfree(blk);
     return 0;
 }
@@ -1119,13 +1221,14 @@ free_vdev:
 }
 
 static void __vhost_blk_release(struct vhost_device *vdev) {
-    trace("__vhost_blk_release");
+    mtrace("Destroying virtual block device backend: %s", vdev->ioctl_param.x.create.device_path);
     list_del(&vdev->link);            
     vhost_blk_release(vdev);
     kfree(vdev);
 }
 
-static int __vhost_blk_create(struct ioctl_create *create) {
+static int __vhost_blk_create(struct ioctl_param *param) {
+    struct ioctl_create *create = &param->x.create;
     struct vhost_device *vdev;
     struct vhost_blk *vblk;
     struct file* file;
@@ -1145,6 +1248,7 @@ static int __vhost_blk_create(struct ioctl_create *create) {
         res = -EFAULT;
         goto out_file;
     }
+    vdev->ioctl_param = *param;
 
     vblk = (struct vhost_blk *)vdev->priv;
 
@@ -1161,6 +1265,15 @@ static int __vhost_blk_create(struct ioctl_create *create) {
     }
 
     create->host_priv = (ulong)vblk;
+
+    sprintf(vblk->stat_name, "bdev%d", vblk->index);
+    vblk->fs_device_attr = (struct dev_ext_attribute){ .attr = { .attr = { .name = vblk->stat_name, 
+                                                                           .mode = S_IRUSR | S_IRGRP | S_IROTH }, 
+                                                                 .show = vhost_fs_device_get_stats, 
+                                                                 .store = NULL }, 
+                                                       .var = vblk };
+
+    fs_create_file(&vblk->fs_device_attr);
     return 0;
 
 out_blk:
@@ -1171,6 +1284,44 @@ out:
     return res;
 }
 
+static struct vhost_device *get_blk_device_by_backend(char *device_path) {
+    struct vhost_device *vdev;
+
+    list_for_each_entry(vdev, &devices_list, link) { 
+        if (!strncmp(vdev->ioctl_param.x.create.device_path, 
+                     device_path,
+                     sizeof(vdev->ioctl_param.x.create.device_path)))
+            return vdev;
+    }   
+
+    return NULL;
+}
+
+static void remove_blk_device_by_backend(char *device_path) {
+    struct vhost_device *vdev;
+
+    vdev = get_blk_device_by_backend(device_path);
+    if (vdev)
+        __vhost_blk_release(vdev);
+}
+/*
+static int remove_blk_device_by_backend(char *device_path) {
+    struct vhost_device *vdev;
+
+    list_for_each_entry(vdev, &devices_list, link) { 
+        if (!strncmp(sizeof(vdev->ioctl_param.x.create.device_path), 
+                            vdev->ioctl_param.x.create.device_path, 
+                            device_path)) {
+            __vhost_blk_release(vdev);
+            return 0;
+        }
+    }   
+
+    return -EFAULT;
+}
+*/
+
+/*
 static void remove_blk_device_by_index(int index) {
     struct vhost_device *vdev;
 
@@ -1183,7 +1334,9 @@ static void remove_blk_device_by_index(int index) {
 
     __vhost_blk_release(vdev);
 }
+*/
 
+/*
 static void remove_blk_device_by_uid(uint device_uid) {
     struct vhost_device *vdev;
 
@@ -1194,7 +1347,7 @@ static void remove_blk_device_by_uid(uint device_uid) {
         }
     }
 }
-
+*/
 static void remove_all_blk_devices(void) {
     struct vhost_device *vdev, *n;
 
@@ -1223,13 +1376,13 @@ void sanity_check(void) {
     list_for_each_entry(vdev, &devices_list, link) { 
         blk = vdev->priv;
 #if TRACE_DEBUG
-        mtrace("stat_total_reqs: %d", blk->stat_total_reqs);
+        mtrace("stat_total_reqs: %d", atomic64_read(&blk->stat_total_reqs));
         mtrace("stat_outstanding_reqs: %d", atomic_read(&blk->stat_outstanding_reqs));
         mtrace("stat_max_outstanding_reqs: %d", blk->stat_max_outstanding_reqs);
         mtrace("stat_max_batched_responses: %d", blk->stat_max_batched_responses);
         mtrace("stat_max_response_size: %d", blk->stat_max_response_size);
 #endif
-        mtrace("lmempool->free_list: %d", llist_size(&blk->lmempool.free_list));
+        mtrace("cmempool->free_list: %d", cmempool_size(&blk->cmempool));// llist_size(&blk->lmempool.free_list));
     }
 }
 #endif
@@ -1240,17 +1393,38 @@ long ioctl(struct ioctl_param *local_param) {
     switch (local_param->cmd) {
         case VRIO_IOCTL_CREATE_BLK: {        
             mtrace("ioctl VRIO_IOCTL_CREATE_BLK");
-            res = __vhost_blk_create(&local_param->x.create);
+            if (get_blk_device_by_backend(local_param->x.create.device_path)) {
+                mtrace("Backend block device \'%s\' is already attached", local_param->x.create.device_path);
+                res = -EFAULT;
+                break;
+            }
+
+            res = __vhost_blk_create(local_param);
             break;
         }
 
         case VRIO_IOCTL_REMOVE_DEV: {        
-            mtrace("ioctl VRIO_IOCTL_REMOVE_DEV");
+            struct vhost_device *vdev;
+            int i;
+
+            mtrace("ioctl VRIO_IOCTL_REMOVE_DEV (%s)", local_param->x.create.device_path);
+            vdev = get_blk_device_by_backend(local_param->x.create.device_path);
+            if (vdev) {
+                local_param->guest_ip_address = vdev->ioctl_param.guest_ip_address;
+                memcpy(local_param->guest_mac_address, vdev->ioctl_param.guest_mac_address, 6); 
+                strcpy(local_param->interface_name, vdev->ioctl_param.interface_name);
+                __vhost_blk_release(vdev);
+            }
+
+            res = vdev ? 0 : -EFAULT;
+            break;
+/*
             if (local_param->x.remove.device_id == -1) 
                 remove_all_blk_devices();
             else 
                 remove_blk_device_by_index(local_param->x.remove.device_id);
             break;
+*/
         }
         case VRIO_IOCTL_SANITY_CHECK: {
             mtrace("ioctl VRIO_IOCTL_SANITY_CHECK");
@@ -1287,10 +1461,15 @@ void handler(ulong param1, ulong param2) {
     vhdr = (struct vrio_header *)giovec->iov[0].iov_base;
     vblk = (struct vhost_blk *)vhdr->host_priv;
 
+#if TRACE_DEBUG
+    atrace(vhdr->out_len != len - VRIO_HEADER_SIZE, 
+        etrace("len: %d, VRIO_HEADER_SIZE: %d, out_len: %d", len, VRIO_HEADER_SIZE, vhdr->out_len)); 
+#endif
+
     giovec->iov[0].iov_base += VRIO_HEADER_SIZE;
     giovec->iov[0].iov_len -= VRIO_HEADER_SIZE;
 
-    trace("vhdr->out_len: %d, vhdr->in_len: %d", vhdr->out_len, vhdr->in_len);
+    trace("vhdr->id: %d (blkid), vhdr->out_len: %d, vhdr->in_len: %d", vhdr->id, vhdr->out_len, vhdr->in_len);
     vhost_blk_handle_guest_kick(gsocket ,vblk, vhdr, giovec);
 }
 
@@ -1300,6 +1479,14 @@ static struct vdev vdev_blk = {
     .ioctl = ioctl,
     .run_from_softirq_context = false,
 };
+
+static void fs_create_file(struct dev_ext_attribute *attr) {
+    fs_device_file_create(vdev_blk.fs_dev, attr);
+}
+
+static void fs_remove_file(struct dev_ext_attribute *attr) {
+    fs_device_file_remove(vdev_blk.fs_dev, attr);    
+}
 
 static int vhost_blk_init(void)
 {
