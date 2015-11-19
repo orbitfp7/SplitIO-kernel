@@ -1430,6 +1430,9 @@ static inline void __skb_fill_page_desc(struct sk_buff *skb, int i,
 	 * allocated using __GFP_MEMALLOC.
 	 */
 	frag->page.p		  = page;
+#if 1 /* patchouli vrio-skbuff */
+	frag->page.destructor = NULL;
+#endif
 	frag->page_offset	  = off;
 	skb_frag_size_set(frag, size);
 
@@ -1836,7 +1839,11 @@ static inline int pskb_network_may_pull(struct sk_buff *skb, unsigned int len)
  * NET_IP_ALIGN(2) + ethernet_header(14) + IP_header(20/40) + ports(8)
  */
 #ifndef NET_SKB_PAD
+#if 1 /* patchouli vrio-skbuff */
+#define NET_SKB_PAD	max(128, L1_CACHE_BYTES)
+#else
 #define NET_SKB_PAD	max(32, L1_CACHE_BYTES)
+#endif
 #endif
 
 extern int ___pskb_trim(struct sk_buff *skb, unsigned int len);
@@ -2083,7 +2090,11 @@ static inline void skb_frag_set_destructor(struct sk_buff *skb, int i,
 
 static void skb_frag_destructor_ref(struct skb_frag_destructor *destroy)
 {
-	BUG_ON(destroy == NULL);
+//	BUG_ON(destroy == NULL);
+	
+	if (destroy == NULL)
+		return;
+
 	atomic_inc(&destroy->ref);
 }
 
@@ -2106,8 +2117,9 @@ static inline void __skb_frag_ref(skb_frag_t *frag)
 {
 #if 1 /* patchouli vrio-skbuff */
 	if (unlikely(frag->page.destructor)) {
+//		printk("* ref destructor != 0\n");
 		skb_frag_destructor_ref(frag->page.destructor);
-		return;
+//		return;
 	}
 #endif
 	get_page(skb_frag_page(frag));
@@ -2135,8 +2147,10 @@ static inline void __skb_frag_unref(skb_frag_t *frag)
 {
 #if 1 /* patchouli vrio-skbuff */
 	if (unlikely(frag->page.destructor)) {
+//		printk("* unref destructor != 0\n");
+//		dump_stack();
 		skb_frag_destructor_unref(frag->page.destructor);
-		return;
+//		return;
     }
 #endif
 	put_page(skb_frag_page(frag));
@@ -2192,6 +2206,11 @@ static inline void *skb_frag_address_safe(const skb_frag_t *frag)
 static inline void __skb_frag_set_page(skb_frag_t *frag, struct page *page)
 {
 	frag->page.p = page;
+#if 1 /* patchouli vrio-skbuff */
+	if (frag->page.destructor)
+		printk("set_page: frag->page.destructor != 0");
+	frag->page.destructor = NULL;
+#endif	
 }
 
 /**

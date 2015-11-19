@@ -249,8 +249,12 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 	 * aligned memory blocks, unless SLUB/SLAB debug is enabled.
 	 * Both skb->head and skb_shared_info are cache line aligned.
 	 */
-	size = SKB_DATA_ALIGN(size);
+	size = SKB_DATA_ALIGN(size);	    
+#if 1 /* patchouli skbuff */
+	size += SKB_DATA_ALIGN(NET_SKB_PAD + sizeof(struct skb_shared_info));
+#else
 	size += SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+#endif	
 	data = kmalloc_reserve(size, gfp_mask, node, &pfmemalloc);
 	if (!data)
 		goto nodata;
@@ -281,6 +285,15 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,
 	/* make sure we initialize shinfo sequentially */
 	shinfo = skb_shinfo(skb);
 	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
+#if 1 /* patchouli vrio-skbuff */
+    {
+        int i;
+        for (i=0; i<MAX_SKB_FRAGS; i++)
+            shinfo->frags[i].page.destructor = NULL;
+    }
+
+    skb_reserve(skb, NET_SKB_PAD);    
+#endif
 	atomic_set(&shinfo->dataref, 1);
 	kmemcheck_annotate_variable(shinfo->destructor_arg);
 
@@ -348,6 +361,13 @@ struct sk_buff *build_skb(void *data, unsigned int frag_size)
 	/* make sure we initialize shinfo sequentially */
 	shinfo = skb_shinfo(skb);
 	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
+#if 1 /* patchouli vrio-skbuff */
+    {
+        int i;
+        for (i=0; i<MAX_SKB_FRAGS; i++)
+            shinfo->frags[i].page.destructor = NULL;
+    }
+#endif
 	atomic_set(&shinfo->dataref, 1);
 	kmemcheck_annotate_variable(shinfo->destructor_arg);
 
@@ -3095,6 +3115,11 @@ int skb_gro_receive(struct sk_buff **head, struct sk_buff *skb)
 		pinfo->nr_frags = nr_frags + 1 + skbinfo->nr_frags;
 
 		frag->page.p	  = page;
+#if 1 /* patchouli vrio-skbuff */
+		if (frag->page.destructor)
+			printk("*** frag->page.destructor != 0 ***\n");
+		frag->page.destructor = NULL;
+#endif		
 		frag->page_offset = first_offset;
 		skb_frag_size_set(frag, first_size);
 
