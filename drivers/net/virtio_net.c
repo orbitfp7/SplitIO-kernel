@@ -246,7 +246,7 @@ static struct sk_buff *page_to_skb(struct receive_queue *rq,
 	p = page_address(page);
 
 	/* copy small packet so we can reuse these pages for small data */
-	skb = netdev_alloc_skb_ip_align(vi->dev, GOOD_COPY_LEN);
+	skb = netdev_alloc_skb_ip_align(vi->dev, GOOD_COPY_LEN + 64);
 	if (unlikely(!skb))
 		return NULL;
 
@@ -399,6 +399,7 @@ static void receive_buf(struct receive_queue *rq, void *buf, unsigned int len)
 			dev_kfree_skb(buf);
 		return;
 	}
+
 	if (vi->mergeable_rx_bufs)
 		skb = receive_mergeable(dev, rq, buf, len);
 	else if (vi->big_packets)
