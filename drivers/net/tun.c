@@ -1480,10 +1480,20 @@ void tun_sendskb(struct socket *sock, struct sk_buff *skb)
 {
 	struct tun_file *tfile = container_of(sock, struct tun_file, socket);
 	struct tun_struct *tun = __tun_get(tfile);
+	u32 rxhash;
 
+	rxhash = skb_get_rxhash(skb);
+	netif_rx_ni(skb);
+
+	tun->dev->stats.rx_packets++;
+	tun->dev->stats.rx_bytes += skb->len;
+
+	tun_flow_update(tun, rxhash, tfile);
+/*
     if (!tun)
         return;
     tun_net_xmit(skb, tun->dev);
+*/    
 	tun_put(tun);
 }
 EXPORT_SYMBOL_GPL(tun_sendskb);

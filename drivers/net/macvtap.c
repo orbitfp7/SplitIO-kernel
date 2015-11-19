@@ -1298,7 +1298,7 @@ static int macvtap_device_event(struct notifier_block *unused,
 
 		devt = MKDEV(MAJOR(macvtap_major), vlan->minor);
 		classdev = device_create(macvtap_class, &dev->dev, devt,
-					 dev, "tap%d", dev->ifindex);
+					 dev, vlan->dev->name /* "tap%d" */, dev->ifindex);
 		if (IS_ERR(classdev)) {
 			macvtap_free_minor(vlan);
 			return notifier_from_errno(PTR_ERR(classdev));
