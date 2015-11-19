@@ -118,6 +118,12 @@ typedef enum {TYPE_INCLUDE, TYPE_EXCLUDE} trace_list_type;
 
 #if TRACE
 
+#define NIPQUAD(addr) \
+    (int)((unsigned char *)&addr)[0], \
+    (int)((unsigned char *)&addr)[1], \
+    (int)((unsigned char *)&addr)[2], \
+    (int)((unsigned char *)&addr)[3]
+
 #define BUFF_SIZE 65536
 static char nibble2hex[17] = "0123456789ABCDEF";
 
@@ -163,7 +169,6 @@ static void SUPPRESS_UNUSED tprintk(const char *file_name, const char *func_name
     tvsprintf(tbuff, fmt, args);
     len = tsprintf(kbuff, "[vrio #%d, %d] <%s/%s> %s\n", VRIO_BUILD_NUM, task_cpu(current), file_name, func_name, tbuff);
     printk(kbuff);
-//    printk("[vrio #%d, %d] <%s/%s> %s\n", VRIO_BUILD_NUM, task_cpu(current), file_name, func_name, tbuff);
     
     va_end(args);
     spin_unlock_irqrestore(&lock, flags);
