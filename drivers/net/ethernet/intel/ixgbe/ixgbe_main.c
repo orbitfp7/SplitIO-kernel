@@ -48,10 +48,15 @@
 #include <linux/prefetch.h>
 #include <scsi/fc/fc_fcoe.h>
 
+#define IXGBE_THREAD_POLL
+
 #include "ixgbe.h"
 #include "ixgbe_common.h"
 #include "ixgbe_dcb_82599.h"
 #include "ixgbe_sriov.h"
+
+#include <linux/vrio/trace.h>
+TRACE_ALL;
 
 char ixgbe_driver_name[] = "ixgbe";
 static const char ixgbe_driver_string[] =
@@ -2113,6 +2118,192 @@ static int ixgbe_low_latency_recv(struct napi_struct *napi)
 }
 #endif	/* CONFIG_NET_RX_BUSY_POLL */
 
+#ifdef IXGBE_THREAD_POLL
+
+static void ixgbe_set_poll_mode(struct net_device *dev, bool poll) 
+{
+    struct ixgbe_adapter *adapter = netdev_priv(dev);
+    //bool status;
+
+    e_info(probe, "adapter->num_q_vectors: %d", adapter->num_q_vectors);
+
+//    status = (adapter->flags & IXGBE_FLAG_POLL_ENABLED);
+//    status = (adapter->poll_enabled > 0);
+//    if (status == poll)
+//        return;
+
+    if (poll) {
+        adapter->poll_enabled++;
+        if (adapter->poll_enabled == 1) {
+        //adapter->lock = 0;
+        //adapter->flags |= IXGBE_FLAG_POLL_ENABLED;
+    		e_info(probe, "polling driver is on for %s adapter\n", dev->name);
+	    	ixgbe_do_reset(dev);
+    	}
+    } else {
+    	if (adapter->poll_enabled > 0) {
+	        adapter->poll_enabled--;
+
+	    	if (adapter->poll_enabled == 0) {
+//        adapter->flags &= ~IXGBE_FLAG_POLL_ENABLED;
+//        adapter->poll_enabled--;
+		    	e_info(probe, "interrupts is on for %s adapter\n", dev->name);
+	    		ixgbe_do_reset(dev);
+	    	}
+    	}
+    }    
+}
+
+static void ixgbe_set_itr(struct ixgbe_q_vector *q_vector);
+
+static bool __ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
+			       struct ixgbe_ring *rx_ring,
+			       const int budget)
+{
+	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
+#ifdef IXGBE_FCOE
+	struct ixgbe_adapter *adapter = q_vector->adapter;
+	int ddp_bytes;
+	unsigned int mss = 0;
+#endif /* IXGBE_FCOE */
+	u16 cleaned_count = ixgbe_desc_unused(rx_ring);
+
+	do {
+		union ixgbe_adv_rx_desc *rx_desc;
+		struct sk_buff *skb;
+
+		/* return some buffers to hardware, one at a time is too slow */
+		if (cleaned_count >= IXGBE_RX_BUFFER_WRITE) {
+			ixgbe_alloc_rx_buffers(rx_ring, cleaned_count);
+			cleaned_count = 0;
+		}
+
+		rx_desc = IXGBE_RX_DESC(rx_ring, rx_ring->next_to_clean);
+
+		if (!ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_DD))
+			break;
+
+		/*
+		 * This memory barrier is needed to keep us from reading
+		 * any other fields out of the rx_desc until we know the
+		 * RXD_STAT_DD bit is set
+		 */
+		rmb();
+
+		/* retrieve a buffer from the ring */
+		skb = ixgbe_fetch_rx_buffer(rx_ring, rx_desc);
+
+		/* exit if we failed to retrieve a buffer */
+		if (!skb)
+			break;
+
+		cleaned_count++;
+
+		/* place incomplete frames back on ring for completion */
+		if (ixgbe_is_non_eop(rx_ring, rx_desc, skb))
+			continue;
+
+		/* verify the packet layout is correct */
+		if (ixgbe_cleanup_headers(rx_ring, rx_desc, skb))
+			continue;
+
+		/* probably a little skewed due to removing CRC */
+		total_rx_bytes += skb->len;
+
+		/* populate checksum, timestamp, VLAN, and protocol */
+		ixgbe_process_skb_fields(rx_ring, rx_desc, skb);
+
+#ifdef IXGBE_FCOE
+		/* if ddp, not passing to ULD unless for FCP_RSP or error */
+		if (ixgbe_rx_is_fcoe(rx_ring, rx_desc)) {
+			ddp_bytes = ixgbe_fcoe_ddp(adapter, rx_desc, skb);
+			/* include DDPed FCoE data */
+			if (ddp_bytes > 0) {
+				if (!mss) {
+					mss = rx_ring->netdev->mtu -
+						sizeof(struct fcoe_hdr) -
+						sizeof(struct fc_frame_header) -
+						sizeof(struct fcoe_crc_eof);
+					if (mss > 512)
+						mss &= ~511;
+				}
+				total_rx_bytes += ddp_bytes;
+				total_rx_packets += DIV_ROUND_UP(ddp_bytes,
+								 mss);
+			}
+			if (!ddp_bytes) {
+				dev_kfree_skb_any(skb);
+				continue;
+			}
+		}
+
+#endif /* IXGBE_FCOE */
+		ixgbe_rx_skb(q_vector, skb);
+
+		/* update budget accounting */
+		total_rx_packets++;
+	} while (likely(total_rx_packets < budget));
+
+	u64_stats_update_begin(&rx_ring->syncp);
+	rx_ring->stats.packets += total_rx_packets;
+	rx_ring->stats.bytes += total_rx_bytes;
+	u64_stats_update_end(&rx_ring->syncp);
+	q_vector->rx.total_packets += total_rx_packets;
+	q_vector->rx.total_bytes += total_rx_bytes;
+
+	if (cleaned_count)
+		ixgbe_alloc_rx_buffers(rx_ring, cleaned_count);
+
+	return total_rx_packets; // < budget);
+}
+
+
+static int ixgbe_poll_device(struct net_device *dev, int budget)
+{
+    struct ixgbe_adapter *adapter = netdev_priv(dev);
+    struct ixgbe_q_vector *q_vector; // = adapter->q_vector[0]; 
+	struct ixgbe_ring *ring;
+    int total_rx_packets = 0;
+	int v_idx;
+
+    if (test_bit(__IXGBE_DOWN, &adapter->state)) {
+        return 0;
+    }
+
+    //if (!(adapter->flags & IXGBE_FLAG_POLL_ENABLED))
+    if (unlikely(!adapter->poll_enabled))
+        return 0;
+
+	if (test_and_set_bit(IXGBE_FLAG_POLL_LOCK_BIT ,&adapter->lock))
+		return 0;
+
+    local_bh_disable();
+	for (v_idx = 0; v_idx < adapter->num_q_vectors; v_idx++) {
+		q_vector = adapter->q_vector[v_idx];
+
+#ifdef CONFIG_IXGBE_DCA
+    	if (adapter->flags & IXGBE_FLAG_DCA_ENABLED)
+        	ixgbe_update_dca(q_vector);
+#endif
+
+    	ixgbe_for_each_ring(ring, q_vector->tx) 
+        	ixgbe_clean_tx_irq(q_vector, ring);
+
+    	ixgbe_for_each_ring(ring, q_vector->rx) {
+        	total_rx_packets += __ixgbe_clean_rx_irq(q_vector, ring, /*weight?*/ budget);
+    }
+    
+    if (adapter->rx_itr_setting & 1)
+        ixgbe_set_itr(q_vector);
+    }
+    local_bh_enable();
+
+	clear_bit(IXGBE_FLAG_POLL_LOCK_BIT ,&adapter->lock);
+
+	return total_rx_packets;
+}
+#endif /* IXGBE_THREAD_POLL */
+
 /**
  * ixgbe_configure_msix - Configure MSI-X hardware
  * @adapter: board private structure
@@ -2636,6 +2827,11 @@ static irqreturn_t ixgbe_msix_clean_rings(int irq, void *data)
 {
 	struct ixgbe_q_vector *q_vector = data;
 
+#ifdef IXGBE_THREAD_POLL
+//    if (q_vector->adapter->flags & IXGBE_FLAG_POLL_ENABLED)
+    if (q_vector->adapter->poll_enabled)
+        return IRQ_HANDLED;
+#endif
 	/* EIAM disabled interrupts (on this vector) for us */
 
 	if (q_vector->rx.ring || q_vector->tx.ring)
@@ -2823,7 +3019,13 @@ static irqreturn_t ixgbe_intr(int irq, void *data)
 		ixgbe_ptp_check_pps_event(adapter, eicr);
 
 	/* would disable interrupts here but EIAM disabled it */
-	napi_schedule(&q_vector->napi);
+#ifdef IXGBE_THREAD_POLL
+    //if (!(adapter->flags & IXGBE_FLAG_POLL_ENABLED))
+    if (!adapter->poll_enabled)
+        napi_schedule(&q_vector->napi);
+#else
+    napi_schedule(&q_vector->napi);
+#endif
 
 	/*
 	 * re-enable link(maybe) and non-queue interrupts, no flush.
@@ -7317,6 +7519,10 @@ static const struct net_device_ops ixgbe_netdev_ops = {
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= ixgbe_netpoll,
 #endif
+#ifdef IXGBE_THREAD_POLL
+    .ndo_poll          = ixgbe_poll_device,
+    .ndo_set_poll_mode = ixgbe_set_poll_mode,
+#endif 	
 #ifdef CONFIG_NET_RX_BUSY_POLL
 	.ndo_busy_poll		= ixgbe_low_latency_recv,
 #endif

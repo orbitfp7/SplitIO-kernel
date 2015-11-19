@@ -316,7 +316,11 @@ static inline unsigned int ixgbe_rx_bufsz(struct ixgbe_ring *ring)
 		return (PAGE_SIZE < 8192) ? IXGBE_RXBUFFER_4K :
 					    IXGBE_RXBUFFER_3K;
 #endif
-	return IXGBE_RXBUFFER_2K;
+#if 1 /* patchouli */
+    return IXGBE_RXBUFFER_4K;
+#else
+    return IXGBE_RXBUFFER_2K;
+#endif
 }
 
 static inline unsigned int ixgbe_rx_pg_order(struct ixgbe_ring *ring)
@@ -325,7 +329,11 @@ static inline unsigned int ixgbe_rx_pg_order(struct ixgbe_ring *ring)
 	if (test_bit(__IXGBE_RX_FCOE, &ring->state))
 		return (PAGE_SIZE < 8192) ? 1 : 0;
 #endif
+#if 1 /* patchouli */
+    return 1;
+#else
 	return 0;
+#endif
 }
 #define ixgbe_rx_pg_size(_ring) (PAGE_SIZE << ixgbe_rx_pg_order(_ring))
 
@@ -459,8 +467,12 @@ static inline bool ixgbe_qv_unlock_poll(struct ixgbe_q_vector *q_vector)
 /* true if a socket is polling, even if it did not get the lock */
 static inline bool ixgbe_qv_ll_polling(struct ixgbe_q_vector *q_vector)
 {
+#if 1 /* patchouli */
+	return false;
+#else
 	WARN_ON(!(q_vector->state & IXGBE_QV_LOCKED));
 	return q_vector->state & IXGBE_QV_USER_PEND;
+#endif
 }
 #else /* CONFIG_NET_RX_BUSY_POLL */
 static inline void ixgbe_qv_init_lock(struct ixgbe_q_vector *q_vector)
@@ -606,6 +618,13 @@ struct ixgbe_adapter {
 #define IXGBE_FLAG_FCOE_ENABLED                 (u32)(1 << 21)
 #define IXGBE_FLAG_SRIOV_CAPABLE                (u32)(1 << 22)
 #define IXGBE_FLAG_SRIOV_ENABLED                (u32)(1 << 23)
+#if 1 /* patchouli */
+//#define IXGBE_FLAG_POLL_ENABLED                 (u32)(1 << 24)
+
+	int  poll_enabled;
+	ulong lock;
+#define IXGBE_FLAG_POLL_LOCK_BIT                1
+#endif
 
 	u32 flags2;
 #define IXGBE_FLAG2_RSC_CAPABLE                 (u32)(1 << 0)
