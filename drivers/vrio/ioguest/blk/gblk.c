@@ -17,7 +17,7 @@
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 
-#define TRACE_LEVEL 2
+//  #define TRACE_LEVEL 4
 
 #include <linux/vrio/trace.h>
 #include <linux/vrio/generic.h>
@@ -27,7 +27,8 @@
 TRACE_ALL;
 
 #include <linux/vrio/cqueue.h>
-#include <linux/vrio/lmempool.h>
+//#include <linux/vrio/lmempool.h>
+#include <linux/vrio/cmempool.h>
 
 #define PART_BITS 4
 
@@ -37,7 +38,8 @@ TRACE_ALL;
 
 #define MAX_REQ_RETRIES 4
 #define MONOTONIC_UP_TIMEOUT 1
-#define MAX_REQ_TIMEOUT 5e6 // 5 seconds
+#define MIN_REQ_TIMEOUT 2e5
+//#define MAX_REQ_TIMEOUT 5e6 // 5 seconds
 
 #if TRACE_DEBUG
 static int debug_drop_response = 0;
@@ -55,7 +57,7 @@ static int num_outstanding_reqs = 128;
 module_param(num_outstanding_reqs, int, S_IRUGO);
 
 /* timeout is in micro-seconds resolution */
-static int initial_request_timeout = 5e4; // 1e4;
+static int initial_request_timeout = 2e5; // 1e6; // 5e4; // 1e4;
 module_param(initial_request_timeout, int, S_IWUSR | S_IRUGO);
 
 static int major;
@@ -73,7 +75,7 @@ struct vrio_blk {
     struct gendisk *disk;
     /* Lock used by the queue */
     spinlock_t lock;
-    struct lmempool lmempool;
+    struct cmempool cmempool;
     /* Ida index - used to track minor number allocations. */
     int index;
 
@@ -114,6 +116,7 @@ struct virtblk_req
     struct gwork_struct drop_request_work;
 #endif
 
+    struct vrio_header vhdr;
     struct skb_frag_destructor destroy;
 
     struct cqueue_struct clink;
@@ -160,13 +163,17 @@ static __always_inline int virtblk_result(struct virtblk_req *vbr)
 }
 
 static __always_inline int vbr_read_dir(struct virtblk_req *vbr) {    
-    return (vbr->out_hdr.type & VIRTIO_BLK_T_OUT) == 0;
+    return (vbr->out_hdr.type & (VIRTIO_BLK_T_OUT | VIRTIO_BLK_T_FLUSH)) == 0;
+}
+
+static __always_inline int vbr_flush_req(struct virtblk_req *vbr) {
+    return (vbr->out_hdr.type == VIRTIO_BLK_T_FLUSH);
 }
 
 static __always_inline struct virtblk_req *virtblk_alloc_req(struct vrio_blk *vblk) {
     struct virtblk_req *vbr;
 
-    vbr = lmempool_alloc(&vblk->lmempool);
+    vbr = cmempool_alloc(&vblk->cmempool);
     if (!vbr) {
 #if TRACE_DEBUG
         trace("mempool_alloc failed, max_outstanding_reqs: %d", vblk->stat_max_outstanding_reqs);
@@ -204,7 +211,7 @@ static __always_inline struct virtblk_req *virtblk_alloc_req(struct vrio_blk *vb
 static __always_inline void virtblk_free_req(struct virtblk_req *vbr) {
     struct vrio_blk *vblk = vbr->vblk;
 
-    lmempool_free(&vblk->lmempool, vbr);    
+    cmempool_free(&vblk->cmempool, vbr);    
 #if TRACE_DEBUG
     atomic_dec(&vblk->stat_outstanding_reqs);
 #endif
@@ -221,8 +228,8 @@ int destroy_skb_frag(struct skb_frag_destructor *destructor) {
 }
 
 #if REQUEST_TIMEOUT
-#define ns_to_us(x) (x >> 10)
-#define us_to_ns(x) (x << 10)
+#define ns_to_us(x) ((x) >> 10)
+#define us_to_ns(x) ((x) << 10)
 
 static inline u64 get_us_clock(void)
 {
@@ -247,34 +254,35 @@ static __always_inline int get_vblk_timeout(struct virtblk_req *vbr);
 static __always_inline int virtblk_add_buf(struct virtblk_req *vbr) {
     struct skb_frag_destructor *destroy = &vbr->destroy;
     struct vrio_blk *vblk = vbr->vblk;
-    struct vrio_header vhdr;
+//    struct vrio_header vhdr;
     int iov_len = 1, i, err;
     trace("virtblk_add_buf: in: %d, out: %d", vbr->in, vbr->out);
 
     init_frag_destructor(destroy, destroy_skb_frag);
 
-    vhdr.host_priv = vblk->vdev->host_priv;
-    vhdr.guest_priv = (ulong)vbr;
-    vhdr.out_len = 0;
-    vhdr.in_len = 0;
+    vbr->vhdr.host_priv = vblk->vdev->host_priv;
+    vbr->vhdr.guest_priv = (ulong)vbr;
+    vbr->vhdr.out_len = 0;
+    vbr->vhdr.in_len = 0;
 
 #if REQUEST_TIMEOUT
     vbr->issue_time = get_us_clock();
-    vhdr.id = atomic_read(&vbr->id);
+    vbr->vhdr.id = atomic_read(&vbr->id);
+    trace("virtblk_add_buf: id: %d (blkid)", vbr->vhdr.id);
 #endif
 
-    vbr->iov[0].iov_base = &vhdr;
+    vbr->iov[0].iov_base = &vbr->vhdr;
     vbr->iov[0].iov_len = sizeof(struct vrio_header);
 
     for (i=0; i<vbr->out + vbr->in ; ++i) {
         if (i < vbr->out) {
-            vhdr.out_len += vbr->sg[i].length;
+            vbr->vhdr.out_len += vbr->sg[i].length;
             vbr->iov[iov_len].iov_base = sg_virt(&vbr->sg[i]);
             vbr->iov[iov_len].iov_len = vbr->sg[i].length;
             trace("- iov_base(%d/%d/%lp): %.*b", i, vbr->sg[i].length, vbr->iov[iov_len].iov_base, vbr->iov[iov_len].iov_len, vbr->iov[iov_len].iov_base);
             iov_len++;
         } else {
-            vhdr.in_len += vbr->sg[i].length;
+            vbr->vhdr.in_len += vbr->sg[i].length;
             trace("- in iov_base(%d/%d/%lp)" , i, vbr->sg[i].length, sg_virt(&vbr->sg[i]));
         }         
     }        
@@ -310,18 +318,22 @@ static __always_inline void adjust_req_timeout(struct virtblk_req *vbr) {
     struct vrio_blk *vblk = vbr->vblk;
 
     vbr->timeout = vbr->timeout << 1;
-    if (vbr->timeout > MAX_REQ_TIMEOUT)
-        vbr->timeout = MAX_REQ_TIMEOUT;
+//    if (vbr->timeout > MAX_REQ_TIMEOUT)
+//        vbr->timeout = MAX_REQ_TIMEOUT;
 
     if (vbr_read_dir(vbr)) {
         if (vbr->timeout > atomic_read(&vblk->read_req_timeout))
             atomic_set(&vblk->read_req_timeout, vbr->timeout);
+        else 
+            vbr->timeout = atomic_read(&vblk->read_req_timeout);
 //        timeout = atomic_read(&vblk->read_req_timeout) * 2;
 //        atomic_set(&vblk->read_req_timeout, min(timeout, MAX_REQ_TIMEOUT));
     }
     else {
         if (vbr->timeout > atomic_read(&vblk->write_req_timeout))
             atomic_set(&vblk->write_req_timeout, vbr->timeout);
+        else
+            vbr->timeout = atomic_read(&vblk->write_req_timeout);
 //        timeout = atomic_read(&vblk->write_req_timeout) * 2;
 //        atomic_set(&vblk->write_req_timeout, min(timeout, MAX_REQ_TIMEOUT));
     }
@@ -331,7 +343,14 @@ static __always_inline u64 calc_req_timeout(int req_timeout, int req_duration) {
 //    if (unlikely(!req_timeout))
 //        return req_duration;
 
-    return ((req_timeout + req_duration) / 2);
+    return (initial_request_timeout * 0.2) + (req_timeout * 0.8);
+/*
+    u64 new_timeout = (req_timeout * 0.9) + (req_duration * 0.1);
+    if (new_timeout < MIN_REQ_TIMEOUT)
+        new_timeout = MIN_REQ_TIMEOUT;
+
+    return new_timeout;
+*/
 }
 
 static __always_inline void update_req_timeout(struct virtblk_req *vbr, int req_duration) {
@@ -352,6 +371,9 @@ static __always_inline void update_req_timeout(struct virtblk_req *vbr, int req_
 
 static __always_inline int get_vblk_timeout(struct virtblk_req *vbr) {
     struct vrio_blk *vblk = vbr->vblk;
+ 
+    if (vbr_flush_req(vbr))
+        return atomic_read(&vblk->write_req_timeout) << 2;
 
     if (vbr_read_dir(vbr)) {
         return atomic_read(&vblk->read_req_timeout);
@@ -364,7 +386,7 @@ static __always_inline int get_req_timeout(struct virtblk_req *vbr) {
 #if MONOTONIC_UP_TIMEOUT
     return vbr->timeout;
 #else
-    return (vbr->timeout << 4);
+    return (vbr->timeout); // << 1);
 #endif
 }
 
@@ -373,10 +395,26 @@ static __always_inline enum hrtimer_restart timer_callback(struct hrtimer *timer
     struct virtblk_req *vbr = container_of(timer, struct virtblk_req, timer);
     struct vrio_blk *vblk = vbr->vblk;
     ktime_t interval;
+    u64 actual_interval;
     int id, new_id;
     int ret;
 
-    trace("timer_callback");
+    actual_interval = get_us_clock() - vbr->issue_time;
+    trace("timer_callback try: %d, timeout us (%d), actual duration: (%d)", 
+           vbr->retries, get_req_timeout(vbr), actual_interval);
+
+    /* In some cases the timer expires prematurely */
+    if (actual_interval * 1.1 < get_req_timeout(vbr)) {
+        ntrace("timer expired prematured, forwarding (req_timeout: %lu, actual: %lu, delta: %lu)", 
+            get_req_timeout(vbr), actual_interval, get_req_timeout(vbr) - actual_interval);
+        atrace((get_req_timeout(vbr) - actual_interval) < 1e4);
+//        interval = ktime_set(0, 
+//            min_t(u64, us_to_ns(get_req_timeout(vbr) - actual_interval), us_to_ns(10000)));
+        interval = ktime_set(0, us_to_ns(get_req_timeout(vbr) - actual_interval));
+        hrtimer_forward_now(timer, interval);
+
+        return HRTIMER_RESTART;
+    }
 
     new_id = get_next_req_id(vblk);
     if (!(id = atomic_read(&vbr->id)) || (atomic_cmpxchg(&vbr->id, id, new_id) != id)) {
@@ -399,8 +437,8 @@ static __always_inline enum hrtimer_restart timer_callback(struct hrtimer *timer
     }
 
     ntrace("resending request (try: %d, req: %lp), timeout us (%d), actual duration: (%d)", 
-           vbr->retries, vbr ,get_req_timeout(vbr), get_us_clock() - vbr->issue_time);
-    adjust_req_timeout(vbr);
+           vbr->retries, vbr ,get_req_timeout(vbr), actual_interval);
+//    adjust_req_timeout(vbr);
     ntrace("new timeout us (%d)", get_req_timeout(vbr));
 
     interval = ktime_set(0, us_to_ns(get_req_timeout(vbr)));
@@ -481,7 +519,6 @@ static int virtblk_bio_send_data(struct virtblk_req *vbr)
 
     vbr->out = out;
     vbr->in = in;
-
     virtblk_add_req(vbr);
     return 0;
 }
@@ -503,7 +540,7 @@ static void __virtblk_done(struct virtblk_req *vbr);
 #if REQUEST_TIMEOUT
 static void drop_request(struct virtblk_req *vbr) 
 {
-    etrace("request is being dropped (retries: %d)", vbr->retries);
+    etrace("request is being dropped (retries: %d) (blkid: %d)", vbr->retries, vbr->vhdr.id);
     vbr->status = VIRTIO_BLK_S_IOERR;
     vbr->flags = 0;
     __virtblk_done(vbr);
@@ -585,7 +622,7 @@ static __always_inline void virtblk_bio_flush_done(struct virtblk_req *vbr)
 
     trace("virtblk_bio_flush_done");
     if (vbr->flags & VBLK_REQ_DATA) {
-        ntrace("vbr->flags & VBLK_REQ_DATA");
+        trace("vbr->flags & VBLK_REQ_DATA"); //ntrace
         /* Send out the actual write data */
         //ret = generic_work_queue(vblk->vdev->gsocket, virtblk_bio_send_data_work, (ulong)vbr, 0);
         ret = queue_gwork(vblk->vdev->gsocket, &vbr->bio_send_data_work);
@@ -604,7 +641,7 @@ static __always_inline void virtblk_bio_data_done(struct virtblk_req *vbr)
 
     trace("virtblk_bio_data_done");
     if (unlikely(vbr->flags & VBLK_REQ_FUA)) {
-        ntrace("unlikely(vbr->flags & VBLK_REQ_FUA)");
+        trace("unlikely(vbr->flags & VBLK_REQ_FUA)"); //ntrace
         /* Send out a flush before end the bio */
         vbr->flags &= ~VBLK_REQ_DATA;
         //ret = generic_work_queue(vblk->vdev->gsocket, virtblk_bio_send_flush_work, (ulong)vbr, 0);
@@ -715,6 +752,8 @@ static void virtblk_done(struct virtblk_req *vbr, int response_id, struct giovec
 
         virtblk_req_apply(vbr, giovec);
         __virtblk_done(vbr);
+    } else {
+        ntrace("Old response arrived, dropped (response_id: %d)", response_id);
     }
 
 #else
@@ -999,6 +1038,16 @@ static ssize_t virtblk_serial_show(struct device *dev,
                 struct device_attribute *attr, char *buf)
 {
     struct gendisk *disk = dev_to_disk(dev);
+    struct vrio_blk *vblk = disk->private_data;
+    int err;
+
+    err = snprintf(buf, VIRTIO_BLK_ID_BYTES,
+                   "vhost-blk%d", vblk->index);
+
+    return err;
+
+#if 0
+    struct gendisk *disk = dev_to_disk(dev);
     int err;
 
     /* sysfs gives us a PAGE_SIZE buffer */
@@ -1013,8 +1062,10 @@ static ssize_t virtblk_serial_show(struct device *dev,
         return 0;
 
     return err;
+#endif
 }
 DEVICE_ATTR(serial, S_IRUGO, virtblk_serial_show, NULL);
+// DEVICE_ATTR(serial, S_IRUGO, NULL, NULL);
 
 /*
  * Legacy naming scheme used for virtio devices.  We are stuck with it for
@@ -1130,6 +1181,7 @@ static const struct device_attribute dev_attr_cache_type_rw =
 
 static int create_blk_device(struct vrio_device *vdev)
 {
+    char device_name[DISK_NAME_LEN];
     struct vrio_blk *vblk;
     struct request_queue *queue;
     int err, index;
@@ -1170,7 +1222,7 @@ static int create_blk_device(struct vrio_device *vdev)
     vblk->sg_elems = sg_elems;
 
     pool_size = sizeof(struct virtblk_req) + sizeof(struct scatterlist) * sg_elems;
-    if (init_lmempool(&vblk->lmempool, num_outstanding_reqs, pool_size) == false) {
+    if (init_cmempool(&vblk->cmempool, num_outstanding_reqs, pool_size) == false) {
         etrace("init_mempool failed");
         err = -ENOMEM;
         goto out_cqueue;
@@ -1200,7 +1252,11 @@ static int create_blk_device(struct vrio_device *vdev)
     atomic_set(&vblk->request_id, 0);
 #endif
 
-    virtblk_name_format("vrd", index, vblk->disk->disk_name, DISK_NAME_LEN);
+    if (vrio_config_val_len(vdev, VIRTIO_BLK_F_DEV_NAME, 
+        offsetof(struct vrio_blk_config, device_name), device_name, DISK_NAME_LEN)) 
+        virtblk_name_format("vrd", index, vblk->disk->disk_name, DISK_NAME_LEN);
+    else
+        strncpy(vblk->disk->disk_name, device_name, DISK_NAME_LEN);
 
     vblk->disk->major = major;
     vblk->disk->first_minor = index_to_minor(index);
@@ -1324,7 +1380,7 @@ out_del_disk:
 out_put_disk:
     put_disk(vblk->disk);
 out_mempool:
-    done_lmempool(&vblk->lmempool);
+    done_cmempool(&vblk->cmempool);
 out_cqueue:
 //    free_cqueue(vblk->pending_requests);
 
@@ -1352,7 +1408,7 @@ static void remove_blk_device(struct vrio_device *vdev)
 
     refc = atomic_read(&disk_to_dev(vblk->disk)->kobj.kref.refcount);
     put_disk(vblk->disk);
-    done_lmempool(&vblk->lmempool);
+    done_cmempool(&vblk->cmempool);
 //    free_cqueue(vblk->pending_requests);
 
     kfree(vblk);
@@ -1374,14 +1430,16 @@ static unsigned int features[] = {
     VIRTIO_BLK_F_WCE, VIRTIO_BLK_F_TOPOLOGY, VIRTIO_BLK_F_CONFIG_WCE
 };
 */
-static int __create_blk_device(struct ioctl_create *create) {
+static int __create_blk_device(struct ioctl_param *param) { 
+    struct ioctl_create *create = &param->x.create;
     int res;
 
     struct vrio_device *vdev;
     vdev = kmalloc(sizeof(*vdev), GFP_KERNEL);
 
-    vdev->placeholder.vrio_blk_config = create->config.vrio_blk;
-    vdev->config = &vdev->placeholder.vrio_blk_config;
+    vdev->ioctl_param = *param;
+ //   vdev->placeholder.vrio_blk_config = create->config.vrio_blk;
+    vdev->config = &vdev->ioctl_param.x.create.config.vrio_blk; // &vdev->placeholder.vrio_blk_config;
     vdev->features = create->config.vrio_blk.features;
 
     vdev->gsocket = (struct gsocket *)create->gsocket;
@@ -1405,15 +1463,15 @@ free_vdev:
 }
 
 int create_blk_device_thread(void *data) { 
-    struct ioctl_create *create = data;
+    struct ioctl_param *param = data;
     trace("blk_thread");
-    __create_blk_device(create);
-    kfree(create);
+    __create_blk_device(param);
+    kfree(param);
     return 0;
 }
 
 static void __remove_blk_device(struct vrio_device *vdev) {
-    trace("__remove_blk_device");
+    mtrace("Destroying virtual block device frontend: %s", vdev->ioctl_param.x.create.device_path);
     list_del(&vdev->link);            
     remove_blk_device(vdev);
     gfree_gsocket(vdev->gsocket);
@@ -1422,6 +1480,28 @@ static void __remove_blk_device(struct vrio_device *vdev) {
 //    module_put(THIS_MODULE);
 }
 
+static struct vrio_device *get_blk_device_by_backend(char *device_path) {
+    struct vrio_device *vdev;
+
+    list_for_each_entry(vdev, &devices_list, link) { 
+       if (!strncmp(vdev->ioctl_param.x.create.device_path, 
+                    device_path,
+                    sizeof(vdev->ioctl_param.x.create.device_path)))
+            return vdev;
+     }
+
+     return NULL;
+}
+
+static void remove_blk_device_by_backend(char *device_path) {
+    struct vrio_device *vdev;
+
+    vdev = get_blk_device_by_backend(device_path);
+    if (vdev)
+        __remove_blk_device(vdev);        
+}
+
+/*
 static void remove_blk_device_by_index(int index) {
     struct vrio_device *vdev;
 
@@ -1445,7 +1525,7 @@ static void remove_blk_device_by_uid(uint device_uid) {
         }
     }
 }
-
+*/
 static void remove_all_blk_devices(void) {
     struct vrio_device *vdev, *n;
 
@@ -1484,31 +1564,34 @@ void sanity_check(void) {
         mtrace("req_retries: %d", vblk->max_retries);
 #endif        
 #endif
-        mtrace("lmempool->free_list: %d", llist_size(&vblk->lmempool.free_list));
+        mtrace("cmempool->free_list: %d", cmempool_size(&vblk->cmempool)); // llist_size(&vblk->lmempool.free_list));
     }
 }
 #endif
 
 long ioctl(struct ioctl_param *local_param) {
-    struct ioctl_create *create;
 
     switch (local_param->cmd) {
         case VRIO_IOCTL_CREATE_BLK: {                                            
+            struct ioctl_param *param;
+            
             mtrace("ioctl VRIO_IOCTL_CREATE_BLK");
-            create = (struct ioctl_create *)kmalloc(sizeof(struct ioctl_create), GFP_KERNEL);
-            *create = local_param->x.create;
-            kthread_run(create_blk_device_thread, create, "blk-create");
+            param = (struct ioctl_param *)kmalloc(sizeof(struct ioctl_param), GFP_KERNEL);
+            *param = *local_param;
+            kthread_run(create_blk_device_thread, param, "blk-create");
             break;
         }
         case VRIO_IOCTL_REMOVE_DEV: {
             mtrace("ioctl VRIO_IOCTL_REMOVE_DEV");
+            remove_blk_device_by_backend(local_param->x.create.device_path);
 //            remove_blk_device_by_uid(local_param->x.remove.device_uid);
 //            remove_blk_device_by_index(local_param->x.remove.device_id);
+/*
             if (local_param->x.remove.device_id == -1) 
                 remove_all_blk_devices();
             else 
                 remove_blk_device_by_index(local_param->x.remove.device_id);                
-            
+*/            
             break;
         }
         case VRIO_IOCTL_SANITY_CHECK: {
@@ -1555,7 +1638,7 @@ void handler(ulong param1, ulong param2) {
         trace("len: %d", len);
         ret = memcpy_fromiovecend_skip((unsigned char *)&vhdr, giovec->iov, giovec->iov_len, VRIO_HEADER_SIZE);
         atrace(ret != 0, goto done);
-        trace("VRIO_HEADER_SIZE + vhdr.out_len: %d", VRIO_HEADER_SIZE + vhdr.out_len);
+        trace("vhdr.id: %d (blkid), VRIO_HEADER_SIZE + vhdr.out_len: %d", vhdr.id, VRIO_HEADER_SIZE + vhdr.out_len);
         len -= (VRIO_HEADER_SIZE + vhdr.out_len);
         atrace(len < 0, goto done);
         atrace(vhdr.guest_priv == 0, goto done);
