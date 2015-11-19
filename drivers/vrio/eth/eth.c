@@ -11,6 +11,7 @@
 #include <net/sock.h>
 #include <linux/tcp.h>
 #include <linux/ip.h>
+#include <linux/inetdevice.h>
 #include <linux/virtio_net.h>
 #include <linux/if_macvlan.h>
 #include <linux/if_vlan.h>
@@ -30,6 +31,7 @@
 TRACE_ALL;
 
 #include <linux/vrio/cqueue.h>
+#include <linux/vrio/cmempool.h>
 
 int l2_packet_size = 1514; 
 module_param(l2_packet_size, int, S_IRUGO);
@@ -102,15 +104,14 @@ rx_handler_result_t rx_handler(struct sk_buff **pskb) {
 
     skb_push(skb, ETH_HLEN);
     l2packet = recv_l2packet_skb(raw_socket, skb);
-    trace("recv_l2packet: 0x%p", l2packet);
+//    trace("recv_l2packet: 0x%p", l2packet);
     if (l2packet == NULL) {
     	skb->len -= ETH_HLEN;
         skb->data += ETH_HLEN;
-        trace("recv_l2packet_skb returned NULL");
+//        trace("recv_l2packet_skb returned NULL");
         rx_dropped_packets++;
         goto out;
     }
-
     process_l2packet(raw_socket, l2packet);
     large_packet = __recv_large_packet(raw_socket);
 
@@ -129,12 +130,15 @@ rx_handler_result_t rx_handler(struct sk_buff **pskb) {
 #else
     if (large_packet && (l2socket = process_large_packet(raw_socket, large_packet))) {
 #endif
-        trace("packet is ready, source address: %.*b, source port: %d, dest port: %d", 
+        trace("packet is ready, source address: %.*b, source port: %d, dest port: %d; tcpsocket: src %d.%d.%d.%d:%d, dest %d.%d.%d.%d:%d ", 
                           6, 
                           large_packet->bsocket.l2address.mac_address, 
                           large_packet->bsocket.l2address.port, 
-                          l2socket->src_port);
-
+                          l2socket->src_port,
+			  NIPQUAD(large_packet->bsocket.l2address.tcpsession->src_ip),
+			  ntohs(large_packet->bsocket.l2address.tcpsession->src_port),
+			  NIPQUAD(large_packet->bsocket.l2address.tcpsession->dest_ip),
+                          ntohs(large_packet->bsocket.l2address.tcpsession->dest_port));
         trace("l2socket->handler: %lp, bsocket: %lp, biovec: %lp, from_softirq: %d",
             l2socket->handler, &large_packet->bsocket, &large_packet->biovec, l2socket->run_from_softirq_context);
 
@@ -165,6 +169,64 @@ out:
     return ret;
 }
 
+__u32 get_ifaddr_by_net_device(struct net_device *ndev) {
+    struct in_device *in_dev = rcu_dereference(ndev->ip_ptr);
+    struct in_ifaddr *ifap;
+
+    // in_dev has a list of IP addresses (because an interface can have multiple)
+    for (ifap = in_dev->ifa_list; ifap != NULL; ifap = ifap->ifa_next) {
+        return (__u32)ifap->ifa_address;
+    }
+
+    return 0;
+}
+
+#if 0
+
+>  int get_ifaddr_by_name(const char *ifname, __u32 * addr)
+>  {
+>         cnet_device;
+>         struct in_device *pin_device;
+>         struct in_ifaddr* inet_ifaddr;
+>
+>         read_lock_bh(&dev_base_lock);
+>  #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,22)
+>         pnet_device = dev_base;
+>  #else
+>         pnet_device = first_net_device();
+>  #endif
+>         while (pnet_device != NULL)
+>         {
+>                 if ((netif_running(pnet_device))
+>                                 && (pnet_device->ip_ptr != NULL)
+>                                 && (strcmp(pnet_device->name, ifname) == 0))
+>                 {
+>                         pin_device =
+>                                 (struct in_device *) pnet_device->ip_ptr;
+>                         inet_ifaddr = pin_device->ifa_list;
+>                         if(inet_ifaddr == NULL)
+>                         {
+>                                 printk("ifa_list is null!\n");
+>                                 break;
+>                         }
+>                         /* ifa_local: ifa_address is the remote point in ppp */
+>                         *addr = (inet_ifaddr->ifa_local);
+>                           read_unlock_bh(&dev_base_lock);
+>                         return 1;
+>                 }
+>  #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,22)
+>                 pnet_device = pnet_device->next;
+>  #else
+>                 pnet_device = next_net_device(pnet_device);
+>  #endif
+>
+>         }
+>
+>         read_unlock_bh(&dev_base_lock);
+>         return -1;              /* address not found! */
+>  }
+#endif
+
 struct raw_socket *__open_raw_socket(char *if_name, data_handler handler) {
     struct net *net;
     struct net_device *ndev = NULL;
@@ -180,7 +242,7 @@ struct raw_socket *__open_raw_socket(char *if_name, data_handler handler) {
 
     for (i=0; i<MAX_PORTS; i++)
         raw_socket->l2sockets[i] = NULL;
-
+/*
     raw_socket->l2packet_list = (struct l2packet *)vmalloc(sizeof(struct l2packet) * l2_packet_list_size);
     if (raw_socket->l2packet_list == NULL) {
         etrace("failed to allocate l2packet_list");
@@ -188,6 +250,16 @@ struct raw_socket *__open_raw_socket(char *if_name, data_handler handler) {
     }
     raw_socket->large_packet_list = (struct large_packet *)vmalloc(sizeof(struct large_packet) * large_packet_list_size);
     if (raw_socket->large_packet_list == NULL) {
+        etrace("failed to allocate large_packet_list");
+        goto free_l2packet_list;
+    }
+*/
+    if (init_cmempool(&raw_socket->l2packet_pool, l2_packet_list_size, sizeof(struct l2packet)) == false) {
+        etrace("failed to allocate l2packet_list");
+        goto free_raw_socket;        
+    }
+    
+    if (init_cmempool(&raw_socket->large_packet_pool, large_packet_list_size, sizeof(struct large_packet)) == false) {
         etrace("failed to allocate large_packet_list");
         goto free_l2packet_list;
     }
@@ -212,6 +284,14 @@ struct raw_socket *__open_raw_socket(char *if_name, data_handler handler) {
         goto put_ndev;
     }
 
+    raw_socket->ip = get_ifaddr_by_net_device(ndev);
+    if  (raw_socket->ip)
+        trace("IP address of device %s is %d.%d.%d.%d", if_name, NIPQUAD(raw_socket->ip));
+    else {
+        ntrace("Device %s doesn't have an IP address", if_name);
+//        goto put_ndev;
+    }
+
     err = dev_open(ndev);          
     if (err) {                         
         etrace("dev_open failed with error: %d", err);
@@ -233,6 +313,8 @@ struct raw_socket *__open_raw_socket(char *if_name, data_handler handler) {
     mac_address = ndev->dev_addr;
     copy_mac(raw_socket->mac_address, mac_address);
     atomic_set(&raw_socket->next_id, 0);
+
+    INIT_LIST_HEAD(&raw_socket->active_tcp_sessions);
 
 #if TRACE_DEBUG
     atomic_set(&raw_socket->l2packet_free_list_size, 0);
@@ -259,9 +341,11 @@ put_ndev:
 free_rtnl_lock:
     rtnl_unlock();
 //free_large_packet_list:
-    vfree(raw_socket->large_packet_list);
+    done_cmempool(&raw_socket->large_packet_pool);
+//    vfree(raw_socket->large_packet_list);
 free_l2packet_list:
-    vfree(raw_socket->l2packet_list);
+    done_cmempool(&raw_socket->l2packet_pool);
+//    vfree(raw_socket->l2packet_list);
 free_raw_socket:
     vfree(raw_socket);
 exit:
@@ -290,8 +374,10 @@ void close_raw_socket(struct raw_socket *raw_socket) {
         raw_socket->ndev = NULL;
     }
     
-    vfree(raw_socket->l2packet_list);
-    vfree(raw_socket->large_packet_list);
+    done_cmempool(&raw_socket->l2packet_pool);
+    done_cmempool(&raw_socket->large_packet_pool);
+//    vfree(raw_socket->l2packet_list);
+//    vfree(raw_socket->large_packet_list);
 
     vfree(raw_socket);
 }
@@ -400,13 +486,31 @@ void send_raw_skb(struct bsocket *bsocket, struct sk_buff *skb) {
 }
 EXPORT_SYMBOL(send_raw_skb);
 
-void init_l2address(struct l2address *l2address, unchar *mac_address, unchar port) {
+void init_l2address(struct l2address *l2address, 
+                    unchar *mac_address, 
+                    unchar port,
+                    __u32 ip,
+                    __be16 tcp_port) {
     copy_mac(l2address->mac_address, mac_address);
     l2address->port = port;
+
+    /* TCP virtual socket */
+    l2address->ip_addr = ip;
+    l2address->tcp_port = tcp_port;
+
+    l2address->tcpsession = NULL;
+
+//    atomic_set(&l2address->tcpsocket.id, 1000-1);
+
+//    atomic_set(&l2address->tcpsocket.seq, 0);
+//    atomic_set(&l2address->tcpsocket.ack, 0);
+//    l2address->tcpsocket.type = 0;
 }
 EXPORT_SYMBOL(init_l2address);
 
-struct l2address *create_l2address(unchar *mac_address, unchar port) {
+struct l2address *create_l2address(unchar *mac_address, unchar port,
+                                   __u32 ip,
+                                   __be16 tcp_port) {
     struct l2address *l2address;
 
     l2address = (struct l2address*)vmalloc(sizeof(struct l2address));
@@ -415,7 +519,9 @@ struct l2address *create_l2address(unchar *mac_address, unchar port) {
         return NULL;
     }                                                                    
 
-    init_l2address(l2address, mac_address, port);
+    init_l2address(l2address, mac_address, port, 
+                   ip,
+                   tcp_port);
     return l2address;
 }
 EXPORT_SYMBOL(create_l2address);
@@ -424,12 +530,12 @@ void free_l2address(struct l2address *l2address) {
     vfree(l2address);
 }
 EXPORT_SYMBOL(free_l2address);
-
+/*
 void l2socket_address(struct l2address *l2address, struct l2socket *l2socket) {
     init_l2address(l2address, l2socket->raw_socket->mac_address, l2socket->src_port);
 }
 EXPORT_SYMBOL(l2socket_address);
-
+*/
 struct bsocket *l2socket_dequeue(struct l2socket *l2socket, struct biovec **biovec) {
     struct large_packet *large_packet;
 
@@ -446,9 +552,12 @@ EXPORT_SYMBOL(l2socket_dequeue);
 static __always_inline void __linearize_skb_portion(struct sk_buff *skb, size_t size) {
     unsigned int grow = size - skb_headlen(skb);
     skb_frag_t *frag = &skb_shinfo(skb)->frags[0];
-            
+//    atrace(grow > skb->len, return);
+    atrace(grow > skb_frag_size(frag) && skb_shinfo(skb)->nr_frags > 1, return);
     grow = min(skb->len, grow);
 
+    trace("skb->len: %d, skb->data_len: %d, skb_headlen: %d", 
+        skb->len, skb->data_len, skb_headlen(skb));            
     skb->data_len -= grow;
 
     frag->page_offset += grow;
@@ -461,31 +570,67 @@ static __always_inline void __linearize_skb_portion(struct sk_buff *skb, size_t 
             skb_shinfo(skb)->frags + 1,
             --skb_shinfo(skb)->nr_frags * sizeof(skb_frag_t));
     }
+
+//    return grow;
 }
 
 static __always_inline void linearize_skb_portion(struct sk_buff *skb, size_t size) {
+    unsigned int grow = size - skb_headlen(skb);
     skb_frag_t *frag = &skb_shinfo(skb)->frags[0];
     struct page *page = skb_frag_page(frag); 
-    int grow;
+//    int grow;
 
-    grow = min(size, (size_t)skb_frag_size(frag));
+    atrace(grow > skb_frag_size(frag) && skb_shinfo(skb)->nr_frags > 1, return);
+    grow = min(grow, (size_t)skb_frag_size(frag));
+//    grow = min(size, (size_t)skb_frag_size(frag));
     trace("grow: %d, size: %d, frag_size: %d", grow, size, skb_frag_size(frag));
     trace("skb->data: %lp, skb->tail: %lp", skb->data, skb_tail_pointer(skb));
+    if (!grow)
+        return;
 
     memcpy(skb_tail_pointer(skb), 
         page_address(page) + frag->page_offset, 
         grow);   
 
-    __linearize_skb_portion(skb, grow);
+    __linearize_skb_portion(skb, size); // grow);
     skb->tail += grow;
 }
 
 static __always_inline void strip_skb_headers(struct sk_buff *skb) {
     int header_size = L2_PACKET_HEADER_SIZE + sizeof(struct vrio_header);
-    trace("stripping header_size: %d", header_size);
-    if (header_size < skb_headlen(skb)) 
+    trace("stripping header_size: %d, skb->len: %d, skb_headroom: %d, skb_headlen: %d, skb_tailroom: %d, tailroom: %d", 
+        header_size, skb->len, skb_headroom(skb), skb_headlen(skb), skb_tailroom(skb), skb->end - skb->tail);
+
+    /* Complicated (bad) code, should be revised and simplified */
+
+    if (header_size < skb_headlen(skb)) {
+        int linearize_len = 54 + 10;
+
         skb_pull(skb, header_size);
-    else {
+        trace("(head: %lp, data: %lp, tail: %lp, end: %lp)", 
+                skb->head, skb->data, skb->tail, skb->end);
+
+        if (skb_headlen(skb) >= linearize_len)
+            return;
+
+        if (skb_shinfo(skb)->nr_frags &&  
+            skb_headlen(skb) < linearize_len &&
+            skb->len >= linearize_len) {
+            trace("linearizing %d bytes (head: %lp, data: %lp, tail: %lp, end: %lp)", 
+                linearize_len, skb->head, skb->data, skb->tail, skb->end);
+
+            atrace((skb->end - skb->tail) < linearize_len, return);
+
+            linearize_skb_portion(skb, linearize_len);
+            trace("post linearize: %d", skb_headlen(skb));
+        }
+    } else {
+        /* 
+            
+            Doesn't work
+
+        */
+
         trace("using pskb_pull, header_size: %d, skb_headlen: %d, skb_shinfo(skb)->nr_frags: %d", header_size, skb_headlen(skb), skb_shinfo(skb)->nr_frags);        
         atrace(skb_shinfo(skb)->frag_list != NULL);
 
@@ -497,6 +642,9 @@ static __always_inline void strip_skb_headers(struct sk_buff *skb) {
             __linearize_skb_portion(skb, header_size);
             skb->len -= header_size;
             linearize_skb_portion(skb, 10 + 54);
+            trace("post linearizing (head: %lp, data: %lp, tail: %lp, end: %lp)", 
+                   skb->head, skb->data, skb->tail, skb->end);
+            trace("skb->data(%d): %.*b", skb_headlen(skb), skb_headlen(skb), skb->data);
             return;
         }
 
@@ -586,8 +734,8 @@ void trace_raw_socket(struct raw_socket *raw_socket) {
 #endif
         }
     }                
-    mtrace("ll2packet_free_list size: %d", llist_size(&raw_socket->ll2packet_free_list));
-    mtrace("llarge_packet_free_list size: %d", llist_size(&raw_socket->llarge_packet_free_list));
+    mtrace("ll2packet_free_list size: %d", cmempool_size(&raw_socket->l2packet_pool));// llist_size(&raw_socket->ll2packet_free_list));
+    mtrace("llarge_packet_free_list size: %d", cmempool_size(&raw_socket->large_packet_pool));// llist_size(&raw_socket->llarge_packet_free_list));
 
 #if TRACE_DEBUG
     mtrace("l2packet_free_list_size: %d", atomic_read(&raw_socket->l2packet_free_list_size));
@@ -598,6 +746,50 @@ void trace_raw_socket(struct raw_socket *raw_socket) {
     mtrace("large_packet_ready_list size: %d", list_size(&raw_socket->large_packet_ready_list));
 }
 EXPORT_SYMBOL(trace_raw_socket);
+
+void trace_large_packet(struct large_packet* large_packet) {
+    struct l2packet *l2packet, *prev_l2packet = NULL;
+
+    mtrace("large_packet->packet_size: %d", large_packet->packet_size); 
+    mtrace("large_packet->uid: %X", large_packet->uid);
+
+    if (!list_empty(&large_packet->l2packets)) {                
+        list_for_each_entry(l2packet, &large_packet->l2packets, link) {        
+            mtrace("l2header->flags: %d", L2_PACKET_TO_HDR(l2packet)->flags);
+            mtrace("l2header->src_port: %d", L2_PACKET_TO_HDR(l2packet)->src_port);
+            mtrace("l2header->dest_port: %d", L2_PACKET_TO_HDR(l2packet)->dest_port);
+            mtrace("l2header->packet_id: %d", L2_PACKET_TO_HDR(l2packet)->packet_id);
+            mtrace("l2header->expected_packet_size: %d", L2_PACKET_TO_HDR(l2packet)->expected_packet_size);
+            mtrace("L2_PACKET_TO_IP_HDR(l2packet)->id: %d (seq16) ", L2_PACKET_TO_IP_HDR(l2packet)->id);
+            mtrace("l2packet->partial_size: %d", l2packet->partial_size);
+            mtrace("L2_PACKET_TO_TCP_HDR(l2packet)->seq: %d", L2_PACKET_TO_TCP_HDR(l2packet)->seq);
+            mtrace("L2_PACKET_TO_TCP_HDR(l2packet)->ack_seq: %d", L2_PACKET_TO_TCP_HDR(l2packet)->ack_seq);
+
+//            if (prev_l2packet) {                
+//                atrace(l2packetHashID(prev_l2packet) != l2packetHashID(l2packet), 
+//                       return);
+//                atrace(l2packetUID(prev_l2packet) != l2packetUID(l2packet), return);
+//            } else {
+//                atrace((channel_flags(l2packet) & F_FIRST_FRAGMENT) == 0, return);
+//            }
+            prev_l2packet = l2packet;
+        }
+                           
+        l2packet = container_of((&large_packet->l2packets)->prev, struct l2packet, link);
+        atrace((channel_flags(l2packet) & F_LAST_FRAGMENT) == 0, return);
+    }
+
+    mtrace("LP seems to be correct");
+    return;
+}
+
+void trace_biovec(struct biovec *biovec) {
+    struct large_packet *large_packet;
+    large_packet = container_of(biovec, struct large_packet, biovec);
+
+    trace_large_packet(large_packet);
+}
+EXPORT_SYMBOL(trace_biovec);
 
 bool __unit_test_cqueue(struct cqueue *cqueue) {
     bool ret = false;
@@ -835,20 +1027,23 @@ __always_inline int zsend(struct l2socket *l2socket,
                  size_t iov_len, 
                  struct skb_frag_destructor *destroy, 
                  struct l2address *l2address) {
-
     int len = iov_length(iov, iov_len), skb_len, expected_lpacket_size = len;
     unchar packet_id = get_next_packet_id(l2socket->raw_socket);
     struct sk_buff *skb;
     struct iovec _iov[MAX_SKB_FRAGS];
     size_t _iov_len;
-    u32 seq = 0;
+    u32 seq; // = adjust_tcp_session_seq_number(l2address, len);  // atomic_add_return(len, &l2address->tcpsocket.seq) - len;
     int err = -1;
+    
+    attach_tcp_session(l2socket->raw_socket, l2address);
+    seq = adjust_tcp_session_seq_number(l2address, len);  // atomic_add_return(len, &l2address->tcpsocket.seq) - len;
 
     if (likely(destroy))
         skb_frag_destructor_ref(destroy);
 
 #define MAX_SIZE_P 65400
-    while (len > 0) {
+      do {
+//    while (len > 0) {
         _iov_len = move_iovec_page(iov /* from */, _iov /* to */, 
                                    MAX_SIZE_P, MAX_SKB_FRAGS, iov_len);
         trace("len: %d, _iov_len: %d, expected_lpacket_size: %d, iov_len: %d", 
@@ -873,7 +1068,7 @@ __always_inline int zsend(struct l2socket *l2socket,
         trace("skb_len: %d", skb_len);
         len -= skb_len;
         seq += skb_len;
-    }
+    } while (len > 0);
     
     if (likely(destroy))
         skb_frag_destructor_unref(destroy);
@@ -897,10 +1092,66 @@ int zbsend_iov(struct bsocket *bsocket,
 }
 EXPORT_SYMBOL(zbsend_iov);
 
+
+#define ns_to_us(x) (x >> 10)
+#define us_to_ns(x) (x << 10)
+
+static inline u64 get_us_clock(void)
+{
+    return ns_to_us(sched_clock());
+}
+
+ulong issue_time;
+struct hrtimer timer;
+
+static __always_inline enum hrtimer_restart timer_callback(struct hrtimer *timer)
+{
+    trace("timer_callback: duration: %d", get_us_clock() - issue_time);
+ //   trace("timer_callback try: %d, timeout us (%d), actual duration: (%d)", 
+//           vbr->retries, get_req_timeout(vbr), get_us_clock() - vbr->issue_time);
+
+    return HRTIMER_NORESTART;
+}
+
+static __always_inline void setup_req_timer(ulong get_req_timeout) { // struct vrio_blk *vblk, struct virtblk_req *vbr) {
+//    ulong get_req_timeout = 5e4;
+    ktime_t ktime = ktime_set(0, us_to_ns(get_req_timeout));
+    int err;
+    
+    trace("setup_req_timer (timeout us: %d)", get_req_timeout);
+    hrtimer_init(&timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    timer.function = &timer_callback;
+    err = hrtimer_start(&timer, ktime, HRTIMER_MODE_REL);
+    atrace(err != 0);
+}
+
 static int __init eth_init(void) {
     mtrace("module vrio_eth up, l2_packet_size: %d", l2_packet_size);
     mtrace("L2_PACKET_HEADER_SIZE: %d", L2_PACKET_HEADER_SIZE);
+/*
+    char buff[64+1] = "AAAAAAAAAAAAAAAAA" \
+                    "BBBBBBBBBBBBBBBBB" \
+                    "CCCCCCCCCCCCCCCCC" \
+                    "DDDDDDDDDDDDDDDDD";
+    char key[16+1] =  "ABCDEFGHIJKLMNOPQ";
 
+    mtrace("plain: %.*b", 64, buff);
+    encrypt(buff, 64, key);
+    mtrace("enc: %.*b", 64, buff);
+    decrypt(buff, 64, key);
+    mtrace("dec: %.*b", 64, buff);
+*/
+
+/*
+    issue_time = get_us_clock();
+    setup_req_timer(5e4);
+    mdelay(1000);
+    issue_time = get_us_clock();
+    setup_req_timer(5e5);
+    mdelay(1000);
+    issue_time = get_us_clock();
+    setup_req_timer(5e6);
+*/
 #if TRACE_DEBUG
 //    atrace(unit_test_cqueue() == false, return -1);
 //    atrace(test_smp_cqueue(extensive_unit_test) == false, return -1);
@@ -909,7 +1160,7 @@ static int __init eth_init(void) {
     return 0;
 }
 
-static void __exit eth_exit(void) {
+ void __exit eth_exit(void) {
     mtrace("module eth down");
 }
 

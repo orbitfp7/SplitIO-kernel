@@ -43,10 +43,16 @@ struct sk_buff *iovec_to_skb(struct net_device *dev,
                              size_t iov_len,
                              struct skb_frag_destructor *destroy);
 
-void             init_l2address(struct l2address *l2address, unchar *mac_address, unchar port);
-struct l2address *create_l2address(unchar *mac_address, unchar port);
+void             init_l2address(struct l2address *l2address, 
+                                unchar *mac_address, 
+                                unchar port, 
+                                __u32 ip,
+                                __be16 tcp_port);
+struct l2address *create_l2address(unchar *mac_address, unchar port, 
+                                  __u32 ip,
+                                  __be16 tcp_port);
 void             free_l2address(struct l2address *l2address);
-void             l2socket_address(struct l2address *l2address, struct l2socket *l2socket);
+//void             l2socket_address(struct l2address *l2address, struct l2socket *l2socket);
 struct bsocket   *l2socket_dequeue(struct l2socket *l2socket, struct biovec **biovec);
 void             l2socket_dequeue_list(struct l2socket *l2socket, struct list_head *head);
 void             l2socket_splice_list(struct l2socket *l2socket, struct list_head *lp_list);
